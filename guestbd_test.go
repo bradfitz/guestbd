@@ -679,6 +679,57 @@ func TestInodeSharing(t *testing.T) {
 	}
 }
 
+func TestReconnectHitsCache(t *testing.T) {
+	const pageSize = 4096
+	const numPages = 20
+	data := make([]byte, pageSize*numPages)
+	rand.Read(data)
+
+	addr, srv, cleanup := startTestServer(t, data, pageSize)
+	defer cleanup()
+
+	// First connection: read all pages, populating the cache.
+	c1 := newTestClient(t, addr)
+	for i := 0; i < numPages; i++ {
+		c1.read(uint64(i*pageSize), pageSize)
+	}
+	c1.disconnect()
+
+	// Snapshot read path counters.
+	diskColdBefore := srv.readPath.Get("base_disk_cold").Value()
+	diskMissBefore := srv.readPath.Get("base_disk_miss").Value()
+	baseMemBefore := srv.readPath.Get("base_mem").Value()
+
+	// Second connection: same inode, all pages should come from cache.
+	c2 := newTestClient(t, addr)
+	defer c2.disconnect()
+	for i := 0; i < numPages; i++ {
+		got := c2.read(uint64(i*pageSize), pageSize)
+		want := data[i*pageSize : (i+1)*pageSize]
+		if !bytes.Equal(got, want) {
+			t.Fatalf("page %d mismatch on reconnect", i)
+		}
+	}
+
+	diskColdAfter := srv.readPath.Get("base_disk_cold").Value()
+	diskMissAfter := srv.readPath.Get("base_disk_miss").Value()
+	baseMemAfter := srv.readPath.Get("base_mem").Value()
+
+	newCold := diskColdAfter - diskColdBefore
+	newMiss := diskMissAfter - diskMissBefore
+	newMem := baseMemAfter - baseMemBefore
+
+	if newCold != 0 {
+		t.Errorf("expected 0 base_disk_cold reads after reconnect, got %d", newCold)
+	}
+	if newMiss != 0 {
+		t.Errorf("expected 0 base_disk_miss reads after reconnect, got %d", newMiss)
+	}
+	if newMem != int64(numPages) {
+		t.Errorf("expected %d base_mem reads after reconnect, got %d", numPages, newMem)
+	}
+}
+
 func BenchmarkRead(b *testing.B) {
 	const pageSize = 4096
 	data := make([]byte, pageSize*100)

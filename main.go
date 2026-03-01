@@ -31,6 +31,7 @@ func main() {
 	}
 
 	srv := NewServer(*flagFile, *flagPageSize, *flagMaxMem)
+	srv.initExpvar()
 
 	// Debug HTTP server with tsweb.
 	debugMux := http.NewServeMux()

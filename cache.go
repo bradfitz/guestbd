@@ -2,8 +2,10 @@ package main
 
 import (
 	"container/list"
+	"expvar"
 	"sync"
-	"sync/atomic"
+
+	"tailscale.com/metrics"
 )
 
 // pageCache is a content-addressable LRU cache of page data,
@@ -16,10 +18,14 @@ type pageCache struct {
 	items map[pageHash]*list.Element
 	lru   *list.List // front = most recently used
 
-	hits      atomic.Int64
-	misses    atomic.Int64
-	evictions atomic.Int64
-	size      atomic.Int64
+	// counter_guestbd_cache{path="hits|misses|evictions"}
+	path metrics.LabelMap
+
+	// gauge_guestbd_cache_entries
+	entries expvar.Int
+
+	// gauge_guestbd_cache_bytes
+	bytes expvar.Int
 }
 
 type cacheEntry struct {
@@ -28,13 +34,13 @@ type cacheEntry struct {
 }
 
 func newPageCache(maxPages, pageSize int) *pageCache {
-	c := &pageCache{
+	return &pageCache{
 		maxPages: maxPages,
 		pageSize: pageSize,
 		items:    make(map[pageHash]*list.Element),
 		lru:      list.New(),
+		path:     metrics.LabelMap{Label: "path"},
 	}
-	return c
 }
 
 // Get returns the page data for the given hash, if present in the cache.
@@ -44,10 +50,10 @@ func (c *pageCache) Get(h pageHash) ([]byte, bool) {
 
 	if elem, ok := c.items[h]; ok {
 		c.lru.MoveToFront(elem)
-		c.hits.Add(1)
+		c.path.Add("hits", 1)
 		return elem.Value.(*cacheEntry).data, true
 	}
-	c.misses.Add(1)
+	c.path.Add("misses", 1)
 	return nil, false
 }
 
@@ -68,7 +74,8 @@ func (c *pageCache) Put(h pageHash, data []byte) {
 	entry := &cacheEntry{hash: h, data: d}
 	elem := c.lru.PushFront(entry)
 	c.items[h] = elem
-	c.size.Add(1)
+	c.entries.Add(1)
+	c.bytes.Add(int64(c.pageSize))
 
 	for c.lru.Len() > c.maxPages {
 		c.evict()
@@ -83,6 +90,7 @@ func (c *pageCache) evict() {
 	c.lru.Remove(elem)
 	entry := elem.Value.(*cacheEntry)
 	delete(c.items, entry.hash)
-	c.evictions.Add(1)
-	c.size.Add(-1)
+	c.path.Add("evictions", 1)
+	c.entries.Add(-1)
+	c.bytes.Add(-int64(c.pageSize))
 }

@@ -62,7 +62,10 @@ func (c *Conn) readPageData(pageNum int64) ([]byte, error) {
 	dp, dirty := c.dirtyPages[pageNum]
 	c.mu.Unlock()
 
+	c.server.readPages.Add(1)
+
 	if dirty {
+		c.server.readPath.Add("from_write", 1)
 		// Try the global cache first.
 		if data, ok := c.server.cache.Get(dp.hash); ok {
 			return data, nil
@@ -77,13 +80,26 @@ func (c *Conn) readPageData(pageNum int64) ([]byte, error) {
 		return buf, nil
 	}
 
-	data, _, err := c.roFile.readPage(pageNum, c.server.cache)
-	return data, err
+	data, _, result, err := c.roFile.readPage(pageNum, c.server.cache)
+	if err != nil {
+		return nil, err
+	}
+	switch result {
+	case readFromCache:
+		c.server.readPath.Add("base_mem", 1)
+	case readFromDiskCold:
+		c.server.readPath.Add("base_disk_cold", 1)
+	case readFromDiskMiss:
+		c.server.readPath.Add("base_disk_miss", 1)
+	}
+	return data, nil
 }
 
 // handleRead handles an NBD read request, assembling data from
 // potentially multiple pages.
 func (c *Conn) handleRead(offset, length uint64) ([]byte, error) {
+	c.server.readBytes.Add(int64(length))
+
 	result := make([]byte, length)
 	pageSize := uint64(c.server.pageSize)
 
@@ -113,6 +129,8 @@ func (c *Conn) handleRead(offset, length uint64) ([]byte, error) {
 func (c *Conn) handleWrite(offset uint64, data []byte) error {
 	length := uint64(len(data))
 	pageSize := uint64(c.server.pageSize)
+
+	c.server.writeBytes.Add(int64(length))
 
 	pos := uint64(0)
 	for pos < length {
@@ -160,6 +178,7 @@ func (c *Conn) handleWrite(offset uint64, data []byte) error {
 		c.mu.Unlock()
 
 		c.server.cache.Put(h, pageData)
+		c.server.writePages.Add(1)
 		pos += n
 	}
 	return nil

@@ -44,32 +44,43 @@ func newReadonlyFile(f *os.File, size int64, pageSize int) *readonlyFile {
 	}
 }
 
-// numPages returns the total number of pages in the file.
-func (r *readonlyFile) numPages() int64 {
-	return int64(len(r.pageHashes))
+// fileInfo returns the FileInfo for the underlying file.
+func (r *readonlyFile) fileInfo() os.FileInfo {
+	fi, _ := r.f.Stat()
+	return fi
 }
 
-// readPage reads page n from the backing file and returns its data and hash.
-// It uses the cache and lazily populates pageHashes.
-func (r *readonlyFile) readPage(n int64, cache *pageCache) ([]byte, pageHash, error) {
+// readResult describes where a page read was served from.
+type readResult int
+
+const (
+	readFromCache    readResult = iota // hash known, data in LRU cache
+	readFromDiskCold                   // hash unknown (first read of this page), read from disk
+	readFromDiskMiss                   // hash known but evicted from LRU cache, re-read from disk
+)
+
+// readPage reads page n from the backing file and returns its data, hash,
+// and how the read was served (cache hit, cold disk read, or cache miss disk read).
+func (r *readonlyFile) readPage(n int64, cache *pageCache) (data []byte, hash pageHash, result readResult, err error) {
 	r.mu.Lock()
 	h := r.pageHashes[n]
 	r.mu.Unlock()
 
 	var zeroHash pageHash
-	if h != zeroHash {
+	hashKnown := h != zeroHash
+	if hashKnown {
 		// Already have the hash; try cache.
-		if data, ok := cache.Get(h); ok {
-			return data, h, nil
+		if d, ok := cache.Get(h); ok {
+			return d, h, readFromCache, nil
 		}
 	}
 
 	// Need to read from disk.
 	buf := make([]byte, r.pageSize)
 	offset := n * int64(r.pageSize)
-	nr, err := r.f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		return nil, pageHash{}, err
+	nr, readErr := r.f.ReadAt(buf, offset)
+	if readErr != nil && readErr != io.EOF {
+		return nil, pageHash{}, 0, readErr
 	}
 	// Zero-fill remainder (last page may be short).
 	for i := nr; i < r.pageSize; i++ {
@@ -85,5 +96,8 @@ func (r *readonlyFile) readPage(n int64, cache *pageCache) ([]byte, pageHash, er
 	r.mu.Unlock()
 
 	cache.Put(h, buf)
-	return buf, h, nil
+	if hashKnown {
+		return buf, h, readFromDiskMiss, nil
+	}
+	return buf, h, readFromDiskCold, nil
 }

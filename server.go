@@ -2,13 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"expvar"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 
 	"tailscale.com/metrics"
 	"tailscale.com/util/set"
@@ -24,9 +24,16 @@ type Server struct {
 	readonlyFiles map[inodeKey]*readonlyFile
 	conns         set.Set[*Conn]
 
-	activeConns atomic.Int64
-	totalConns  atomic.Int64
-	ops         metrics.LabelMap
+	totalConns  expvar.Int       // counter_guestbd_total_conns
+	activeConns expvar.Int       // gauge_guestbd_active_conns
+	ops         metrics.LabelMap // counter_guestbd_nbd_ops{type=...}
+	readPath    metrics.LabelMap // counter_guestbd_read_path{type=...}
+	readBytes   expvar.Int       // counter_guestbd_read_bytes
+	readPages   expvar.Int       // counter_guestbd_read_pages
+	writeBytes       expvar.Int       // counter_guestbd_write_bytes
+	writePages       expvar.Int       // counter_guestbd_write_pages
+	baseImagesActive expvar.Int       // gauge_guestbd_base_images_active
+	baseImagesCached expvar.Int       // gauge_guestbd_base_images_cached
 }
 
 // NewServer creates a new guestbd server.
@@ -43,15 +50,42 @@ func NewServer(filePath string, pageSize int, maxMem int64) *Server {
 		pageSize:      pageSize,
 		cache:         newPageCache(maxPages, pageSize),
 		readonlyFiles: make(map[inodeKey]*readonlyFile),
-		conns:         make(set.Set[*Conn]),
-		ops:           metrics.LabelMap{Label: "op"},
+		conns:    make(set.Set[*Conn]),
+		ops:      metrics.LabelMap{Label: "type"},
+		readPath: metrics.LabelMap{Label: "type"},
 	}
 
 	return srv
 }
 
+// initExpvar publishes the server's metrics to expvar.
+// Called once from main; not called in tests to avoid duplicate registration panics.
+func (s *Server) initExpvar() {
+	expvar.Publish("counter_guestbd_total_conns", &s.totalConns)
+	expvar.Publish("gauge_guestbd_active_conns", &s.activeConns)
+	expvar.Publish("counter_guestbd_nbd_ops", &s.ops)
+	expvar.Publish("counter_guestbd_read_path", &s.readPath)
+	expvar.Publish("counter_guestbd_read_bytes", &s.readBytes)
+	expvar.Publish("counter_guestbd_read_pages", &s.readPages)
+	expvar.Publish("counter_guestbd_write_bytes", &s.writeBytes)
+	expvar.Publish("counter_guestbd_write_pages", &s.writePages)
+	expvar.Publish("counter_guestbd_cache", &s.cache.path)
+	expvar.Publish("gauge_guestbd_cache_entries", &s.cache.entries)
+	expvar.Publish("gauge_guestbd_cache_bytes", &s.cache.bytes)
+
+	expvar.Publish("gauge_guestbd_base_images_active", &s.baseImagesActive)
+	expvar.Publish("gauge_guestbd_base_images_cached", &s.baseImagesCached)
+
+	ps := new(expvar.Int)
+	ps.Set(int64(s.pageSize))
+	expvar.Publish("gauge_guestbd_page_size", ps)
+}
+
 // getReadonlyFile returns the readonlyFile for the backing file,
-// sharing it across connections with the same inode.
+// sharing it across connections with the same inode. The readonlyFile
+// and its pageHashes table persist even when refcount drops to zero,
+// so that subsequent connections to the same inode benefit from the
+// already-computed hash table (which is the index into the LRU cache).
 func (s *Server) getReadonlyFile() (*readonlyFile, error) {
 	f, err := os.Open(s.filePath)
 	if err != nil {
@@ -69,25 +103,46 @@ func (s *Server) getReadonlyFile() (*readonlyFile, error) {
 
 	if ro, ok := s.readonlyFiles[key]; ok {
 		ro.mu.Lock()
+		wasIdle := ro.refcount == 0
 		ro.refcount++
 		ro.mu.Unlock()
+		if wasIdle {
+			s.baseImagesActive.Add(1)
+		}
 		f.Close()
 		return ro, nil
 	}
 
 	ro := newReadonlyFile(f, fi.Size(), s.pageSize)
 	s.readonlyFiles[key] = ro
+	s.baseImagesActive.Add(1)  // new entry starts with refcount 1
+	s.baseImagesCached.Add(1)
 	return ro, nil
 }
 
-// releaseReadonlyFile decrements the refcount and cleans up if zero.
+// releaseReadonlyFile decrements the refcount. If the refcount reaches
+// zero, it checks whether the file on disk still points to the same
+// inode. If the file is gone or has a different inode, the readonlyFile
+// is removed and its fd closed — no future client can use it. Otherwise
+// it stays in the map so the pageHashes index remains available for the
+// next connection.
 func (s *Server) releaseReadonlyFile(ro *readonlyFile) {
 	ro.mu.Lock()
 	ro.refcount--
 	rc := ro.refcount
 	ro.mu.Unlock()
 
-	if rc <= 0 {
+	if rc > 0 {
+		return
+	}
+
+	s.baseImagesActive.Add(-1)
+
+	// Check whether the file on disk still matches this inode.
+	fi, err := os.Stat(s.filePath)
+	if err != nil || fileInodeKey(fi) != fileInodeKey(ro.fileInfo()) {
+		// File is gone or replaced; no future client will ever
+		// open this inode. Clean it up.
 		s.mu.Lock()
 		for k, v := range s.readonlyFiles {
 			if v == ro {
@@ -97,6 +152,7 @@ func (s *Server) releaseReadonlyFile(ro *readonlyFile) {
 		}
 		s.mu.Unlock()
 		ro.f.Close()
+		s.baseImagesCached.Add(-1)
 	}
 }
 
