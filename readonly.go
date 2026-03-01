@@ -21,24 +21,25 @@ func fileInodeKey(fi os.FileInfo) inodeKey {
 // readonlyFile represents a shared read-only backing file, keyed by inode.
 // Multiple connections to the same file share one readonlyFile.
 type readonlyFile struct {
+	srv      *Server
 	mu       sync.Mutex
 	f        *os.File
 	size     int64
 	refcount int32
-	pageSize int
 
 	// pageHashes is lazily computed per page.
 	// A zero value means the page has not been read from disk yet.
-	// A value equal to zeroPageHash means the page is all zeros.
+	// A value equal to Server.zeroPageHash means the page is all zeros.
 	pageHashes []pageHash
 }
 
-func newReadonlyFile(f *os.File, size int64, pageSize int) *readonlyFile {
+func newReadonlyFile(srv *Server, f *os.File, size int64) *readonlyFile {
+	pageSize := srv.pageSize
 	numPages := (size + int64(pageSize) - 1) / int64(pageSize)
 	return &readonlyFile{
+		srv:        srv,
 		f:          f,
 		size:       size,
-		pageSize:   pageSize,
 		refcount:   1,
 		pageHashes: make([]pageHash, numPages),
 	}
@@ -61,10 +62,13 @@ const (
 
 // readPage reads page n from the backing file and returns its data, hash,
 // and how the read was served (cache hit, cold disk read, or cache miss disk read).
-func (r *readonlyFile) readPage(n int64, cache *pageCache) (data []byte, hash pageHash, result readResult, err error) {
+func (r *readonlyFile) readPage(n int64) (data []byte, hash pageHash, result readResult, err error) {
 	r.mu.Lock()
 	h := r.pageHashes[n]
 	r.mu.Unlock()
+
+	cache := r.srv.cache
+	pageSize := r.srv.pageSize
 
 	var zeroHash pageHash
 	hashKnown := h != zeroHash
@@ -76,14 +80,14 @@ func (r *readonlyFile) readPage(n int64, cache *pageCache) (data []byte, hash pa
 	}
 
 	// Need to read from disk.
-	buf := make([]byte, r.pageSize)
-	offset := n * int64(r.pageSize)
+	buf := make([]byte, pageSize)
+	offset := n * int64(pageSize)
 	nr, readErr := r.f.ReadAt(buf, offset)
 	if readErr != nil && readErr != io.EOF {
 		return nil, pageHash{}, 0, readErr
 	}
 	// Zero-fill remainder (last page may be short).
-	for i := nr; i < r.pageSize; i++ {
+	for i := nr; i < pageSize; i++ {
 		buf[i] = 0
 	}
 

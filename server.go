@@ -16,10 +16,11 @@ import (
 
 // Server is the main guestbd NBD server.
 type Server struct {
-	mu       sync.Mutex
-	filePath string
-	pageSize int
-	cache    *pageCache
+	mu            sync.Mutex
+	filePath      string
+	pageSize      int
+	zeroPageHash  pageHash // sha256 of a page filled entirely with zero bytes
+	cache         *pageCache
 
 	readonlyFiles map[inodeKey]*readonlyFile
 	conns         set.Set[*Conn]
@@ -43,11 +44,10 @@ func NewServer(filePath string, pageSize int, maxMem int64) *Server {
 		maxPages = 1
 	}
 
-	initZeroPageHash(pageSize)
-
 	srv := &Server{
 		filePath:      filePath,
 		pageSize:      pageSize,
+		zeroPageHash:  hashPage(make([]byte, pageSize)),
 		cache:         newPageCache(maxPages, pageSize),
 		readonlyFiles: make(map[inodeKey]*readonlyFile),
 		conns:    make(set.Set[*Conn]),
@@ -113,7 +113,7 @@ func (s *Server) getReadonlyFile() (*readonlyFile, error) {
 		return ro, nil
 	}
 
-	ro := newReadonlyFile(f, fi.Size(), s.pageSize)
+	ro := newReadonlyFile(s, f, fi.Size())
 	s.readonlyFiles[key] = ro
 	s.baseImagesActive.Add(1)  // new entry starts with refcount 1
 	s.baseImagesCached.Add(1)

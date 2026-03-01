@@ -80,7 +80,7 @@ func (c *Conn) readPageData(pageNum int64) ([]byte, error) {
 		return buf, nil
 	}
 
-	data, _, result, err := c.roFile.readPage(pageNum, c.server.cache)
+	data, _, result, err := c.roFile.readPage(pageNum)
 	if err != nil {
 		return nil, err
 	}
