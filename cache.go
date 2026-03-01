@@ -1,12 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"container/list"
+	"crypto/sha256"
 	"expvar"
 	"sync"
 
 	"tailscale.com/metrics"
 )
+
+// pageHash is the sha256 hash of a page's contents.
+// A zero value means the page has not been read from disk yet.
+type pageHash [sha256.Size]byte
+
+func hashPage(data []byte) pageHash {
+	return sha256.Sum256(data)
+}
 
 // pageCache is a content-addressable LRU cache of page data,
 // shared across all connections. Pages are keyed by their sha256 hash.
@@ -18,14 +28,9 @@ type pageCache struct {
 	items map[pageHash]*list.Element
 	lru   *list.List // front = most recently used
 
-	// counter_guestbd_cache{path="hits|misses|evictions"}
-	path metrics.LabelMap
-
-	// gauge_guestbd_cache_entries
-	entries expvar.Int
-
-	// gauge_guestbd_cache_bytes
-	bytes expvar.Int
+	path    metrics.LabelMap // counter_guestbd_cache{path="hits|misses|evictions"}
+	entries expvar.Int       // gauge_guestbd_cache_entries
+	bytes   expvar.Int       // gauge_guestbd_cache_bytes
 }
 
 type cacheEntry struct {
@@ -68,10 +73,7 @@ func (c *pageCache) Put(h pageHash, data []byte) {
 		return
 	}
 
-	d := make([]byte, len(data))
-	copy(d, data)
-
-	entry := &cacheEntry{hash: h, data: d}
+	entry := &cacheEntry{hash: h, data: bytes.Clone(data)}
 	elem := c.lru.PushFront(entry)
 	c.items[h] = elem
 	c.entries.Add(1)
