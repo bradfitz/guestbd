@@ -66,13 +66,53 @@ password-less sudo access, set up ndb mount for testing.
 
 ### Observability
 
-The server uses tailscale.com/tsweb and its De
+The server uses tailscale.com/tsweb (including its DebugHandler) to
+expose pprof, expvar, and a Prometheus-compatible `/debug/varz` endpoint
+on the `--debug-addr` (default `:8080`).
+
+Metrics use normal expvar metrics (which tsweb Prometheus-ifies) and
+tailscale.com/metrics's LabelMap and Histogram types.
+
+#### Counters
+
+| Metric | Description |
+|--------|-------------|
+| `guestbd_total_conns` | Total TCP connections accepted |
+| `guestbd_nbd_ops{type=read\|write\|disconnect\|flush\|trim}` | NBD operations by type |
+| `guestbd_read_bytes` | Total bytes read by clients |
+| `guestbd_read_pages` | Total page reads (dirty + base layer) |
+| `guestbd_read_path{type=base_mem\|base_disk_cold\|base_disk_miss\|from_write}` | Read source breakdown |
+| `guestbd_write_bytes` | Total bytes written by clients |
+| `guestbd_write_pages` | Total dirty pages written |
+| `guestbd_cache{path=hits\|misses\|evictions}` | Page cache operations |
+
+#### Gauges
+
+| Metric | Description |
+|--------|-------------|
+| `guestbd_active_conns` | Currently connected clients |
+| `guestbd_cache_entries` | Pages in the LRU cache |
+| `guestbd_cache_bytes` | Bytes used by the LRU cache |
+| `guestbd_base_images_active` | readonlyFile entries with active connections |
+| `guestbd_base_images_cached` | readonlyFile entries in memory (including idle) |
+| `guestbd_page_size` | Configured page size |
+
+#### Histograms
+
+| Metric | Description |
+|--------|-------------|
+| `guestbd_read_size_bytes` | Distribution of NBD read request sizes |
+| `guestbd_write_size_bytes` | Distribution of NBD write request sizes |
+
+The `read_path` metric is particularly useful for diagnosing cache effectiveness:
+
+- **`base_mem`** — page hash was known and data was in the LRU cache (ideal)
+- **`base_disk_cold`** — page hash was unknown (first read ever, or readonlyFile was recreated due to inode change); had to read from disk
+- **`base_disk_miss`** — page hash was known but data was evicted from the LRU cache; had to re-read from disk (indicates cache is too small)
+- **`from_write`** — read of a page that was previously written on this connection
 
 ## Imports
 
 The server uses tailscale.com/tsweb (including its DebugHandler),
 tailscale.com/util/set.{Set,HandleSet} etc as needed, but doesn't
 depend on tsnet.
-
-Metrics use normal expvar metrics (which tsweb Prometheus-ifies) and
-tailscale.com/metrics's MutliLabelMap if/as needed.
