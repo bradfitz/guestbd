@@ -47,6 +47,9 @@ const (
 	nbdCmdFlush uint16 = 3
 	nbdCmdTrim  uint16 = 4
 
+	// Maximum payload size per the NBD spec.
+	nbdMaxPayload uint32 = 32 * 1024 * 1024 // 32 MB
+
 	// Error codes (Linux errno values)
 	nbdEIO    uint32 = 5
 	nbdEINVAL uint32 = 22

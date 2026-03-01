@@ -346,6 +346,10 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 			return fmt.Errorf("bad request magic: %#x", req.Magic)
 		}
 
+		if (req.Type == nbdCmdRead || req.Type == nbdCmdWrite) && req.Length > nbdMaxPayload {
+			return fmt.Errorf("request length %d exceeds NBD max payload %d", req.Length, nbdMaxPayload)
+		}
+
 		switch req.Type {
 		case nbdCmdRead:
 			s.ops.Add("read", 1)
