@@ -15,7 +15,7 @@ type inodeKey struct {
 
 func fileInodeKey(fi os.FileInfo) inodeKey {
 	stat := fi.Sys().(*syscall.Stat_t)
-	return inodeKey{dev: stat.Dev, ino: stat.Ino}
+	return inodeKey{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}
 }
 
 // readonlyFile represents a shared read-only backing file, keyed by inode.

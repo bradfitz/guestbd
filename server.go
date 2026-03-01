@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"expvar"
 	"fmt"
@@ -210,19 +211,23 @@ func (s *Server) HandleConn(nc net.Conn) {
 
 // serveNBD runs the NBD protocol on the given connection.
 func (s *Server) serveNBD(c *Conn) error {
-	rw := c.tcpConn
+	r := c.tcpConn
+	bw := bufio.NewWriterSize(c.tcpConn, 1<<20) // 1MB
 
 	// Phase 1: Newstyle handshake.
 	var handshake [18]byte
 	binary.BigEndian.PutUint64(handshake[0:8], nbdMagic)
 	binary.BigEndian.PutUint64(handshake[8:16], nbdOptsMagic)
 	binary.BigEndian.PutUint16(handshake[16:18], uint16(nbdFlagFixedNewstyle))
-	if _, err := rw.Write(handshake[:]); err != nil {
+	if _, err := bw.Write(handshake[:]); err != nil {
 		return fmt.Errorf("writing handshake: %w", err)
+	}
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("flushing handshake: %w", err)
 	}
 
 	var clientFlagsBuf [4]byte
-	if _, err := io.ReadFull(rw, clientFlagsBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, clientFlagsBuf[:]); err != nil {
 		return fmt.Errorf("reading client flags: %w", err)
 	}
 	cflags := binary.BigEndian.Uint32(clientFlagsBuf[:])
@@ -234,7 +239,7 @@ func (s *Server) serveNBD(c *Conn) error {
 
 	for {
 		var optHeader [16]byte
-		if _, err := io.ReadFull(rw, optHeader[:]); err != nil {
+		if _, err := io.ReadFull(r, optHeader[:]); err != nil {
 			return fmt.Errorf("reading option: %w", err)
 		}
 		optMagic := binary.BigEndian.Uint64(optHeader[0:8])
@@ -246,7 +251,7 @@ func (s *Server) serveNBD(c *Conn) error {
 
 		optData := make([]byte, optLen)
 		if optLen > 0 {
-			if _, err := io.ReadFull(rw, optData); err != nil {
+			if _, err := io.ReadFull(r, optData); err != nil {
 				return fmt.Errorf("reading option data: %w", err)
 			}
 		}
@@ -256,19 +261,25 @@ func (s *Server) serveNBD(c *Conn) error {
 			var reply [10]byte
 			binary.BigEndian.PutUint64(reply[0:8], exportSize)
 			binary.BigEndian.PutUint16(reply[8:10], txFlags)
-			if _, err := rw.Write(reply[:]); err != nil {
+			if _, err := bw.Write(reply[:]); err != nil {
 				return err
 			}
 			if !noZeroes {
 				var zeros [124]byte
-				if _, err := rw.Write(zeros[:]); err != nil {
+				if _, err := bw.Write(zeros[:]); err != nil {
 					return err
 				}
 			}
-			return s.serveTransmission(c)
+			if err := bw.Flush(); err != nil {
+				return err
+			}
+			return s.serveTransmission(c, r, bw)
 
 		case nbdOptAbort:
-			return s.sendOptReply(rw, optCode, nbdRepAck, nil)
+			if err := s.sendOptReply(bw, optCode, nbdRepAck, nil); err != nil {
+				return err
+			}
+			return bw.Flush()
 
 		case nbdOptGo:
 			// Send NBD_INFO_EXPORT.
@@ -276,7 +287,7 @@ func (s *Server) serveNBD(c *Conn) error {
 			binary.BigEndian.PutUint16(infoData[0:2], nbdInfoExport)
 			binary.BigEndian.PutUint64(infoData[2:10], exportSize)
 			binary.BigEndian.PutUint16(infoData[10:12], txFlags)
-			if err := s.sendOptReply(rw, optCode, nbdRepInfo, infoData[:]); err != nil {
+			if err := s.sendOptReply(bw, optCode, nbdRepInfo, infoData[:]); err != nil {
 				return err
 			}
 			// Send NBD_INFO_BLOCK_SIZE.
@@ -285,27 +296,36 @@ func (s *Server) serveNBD(c *Conn) error {
 			binary.BigEndian.PutUint32(bsData[2:6], 1)                   // minimum
 			binary.BigEndian.PutUint32(bsData[6:10], uint32(s.pageSize)) // preferred
 			binary.BigEndian.PutUint32(bsData[10:14], 32*1024*1024)      // maximum
-			if err := s.sendOptReply(rw, optCode, nbdRepInfo, bsData[:]); err != nil {
+			if err := s.sendOptReply(bw, optCode, nbdRepInfo, bsData[:]); err != nil {
 				return err
 			}
 			// ACK
-			if err := s.sendOptReply(rw, optCode, nbdRepAck, nil); err != nil {
+			if err := s.sendOptReply(bw, optCode, nbdRepAck, nil); err != nil {
 				return err
 			}
-			return s.serveTransmission(c)
+			if err := bw.Flush(); err != nil {
+				return err
+			}
+			return s.serveTransmission(c, r, bw)
 
 		case nbdOptList:
 			// One export with empty name (default).
 			var nameData [4]byte
-			if err := s.sendOptReply(rw, optCode, nbdRepServer, nameData[:]); err != nil {
+			if err := s.sendOptReply(bw, optCode, nbdRepServer, nameData[:]); err != nil {
 				return err
 			}
-			if err := s.sendOptReply(rw, optCode, nbdRepAck, nil); err != nil {
+			if err := s.sendOptReply(bw, optCode, nbdRepAck, nil); err != nil {
+				return err
+			}
+			if err := bw.Flush(); err != nil {
 				return err
 			}
 
 		default:
-			if err := s.sendOptReply(rw, optCode, nbdRepErrUnsup, nil); err != nil {
+			if err := s.sendOptReply(bw, optCode, nbdRepErrUnsup, nil); err != nil {
+				return err
+			}
+			if err := bw.Flush(); err != nil {
 				return err
 			}
 		}
@@ -313,12 +333,10 @@ func (s *Server) serveNBD(c *Conn) error {
 }
 
 // serveTransmission handles the NBD transmission phase.
-func (s *Server) serveTransmission(c *Conn) error {
-	rw := c.tcpConn
-
+func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error {
 	for {
 		var req nbdRequest
-		if err := binary.Read(rw, binary.BigEndian, &req); err != nil {
+		if err := binary.Read(r, binary.BigEndian, &req); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return nil
 			}
@@ -334,12 +352,18 @@ func (s *Server) serveTransmission(c *Conn) error {
 			s.readSizeHist.Observe(float64(req.Length))
 			data, err := c.handleRead(req.Offset, uint64(req.Length))
 			if err != nil {
-				if werr := s.sendReply(rw, req.Handle, nbdEIO, nil); werr != nil {
+				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
+					return werr
+				}
+				if werr := bw.Flush(); werr != nil {
 					return werr
 				}
 				continue
 			}
-			if err := s.sendReply(rw, req.Handle, 0, data); err != nil {
+			if err := s.sendReply(bw, req.Handle, 0, data); err != nil {
+				return err
+			}
+			if err := bw.Flush(); err != nil {
 				return err
 			}
 
@@ -347,16 +371,22 @@ func (s *Server) serveTransmission(c *Conn) error {
 			s.ops.Add("write", 1)
 			s.writeSizeHist.Observe(float64(req.Length))
 			data := make([]byte, req.Length)
-			if _, err := io.ReadFull(rw, data); err != nil {
+			if _, err := io.ReadFull(r, data); err != nil {
 				return fmt.Errorf("reading write data: %w", err)
 			}
 			if err := c.handleWrite(req.Offset, data); err != nil {
-				if werr := s.sendReply(rw, req.Handle, nbdEIO, nil); werr != nil {
+				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
+					return werr
+				}
+				if werr := bw.Flush(); werr != nil {
 					return werr
 				}
 				continue
 			}
-			if err := s.sendReply(rw, req.Handle, 0, nil); err != nil {
+			if err := s.sendReply(bw, req.Handle, 0, nil); err != nil {
+				return err
+			}
+			if err := bw.Flush(); err != nil {
 				return err
 			}
 
@@ -366,26 +396,30 @@ func (s *Server) serveTransmission(c *Conn) error {
 
 		case nbdCmdFlush:
 			s.ops.Add("flush", 1)
-			c.mu.Lock()
-			err := c.dirtyFile.Sync()
-			c.mu.Unlock()
-			errCode := uint32(0)
-			if err != nil {
-				errCode = nbdEIO
+			// No-op: dirty data is ephemeral and lost on disconnect,
+			// so there's no point in syncing to disk for guest VM performance.
+			if err := s.sendReply(bw, req.Handle, 0, nil); err != nil {
+				return err
 			}
-			if err := s.sendReply(rw, req.Handle, errCode, nil); err != nil {
+			if err := bw.Flush(); err != nil {
 				return err
 			}
 
 		case nbdCmdTrim:
 			s.ops.Add("trim", 1)
 			c.handleTrim(req.Offset, uint64(req.Length))
-			if err := s.sendReply(rw, req.Handle, 0, nil); err != nil {
+			if err := s.sendReply(bw, req.Handle, 0, nil); err != nil {
+				return err
+			}
+			if err := bw.Flush(); err != nil {
 				return err
 			}
 
 		default:
-			if err := s.sendReply(rw, req.Handle, nbdEINVAL, nil); err != nil {
+			if err := s.sendReply(bw, req.Handle, nbdEINVAL, nil); err != nil {
+				return err
+			}
+			if err := bw.Flush(); err != nil {
 				return err
 			}
 		}
