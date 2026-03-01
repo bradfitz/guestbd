@@ -31,10 +31,12 @@ type Server struct {
 	readPath    metrics.LabelMap // counter_guestbd_read_path{type=...}
 	readBytes   expvar.Int       // counter_guestbd_read_bytes
 	readPages   expvar.Int       // counter_guestbd_read_pages
-	writeBytes       expvar.Int       // counter_guestbd_write_bytes
-	writePages       expvar.Int       // counter_guestbd_write_pages
-	baseImagesActive expvar.Int       // gauge_guestbd_base_images_active
-	baseImagesCached expvar.Int       // gauge_guestbd_base_images_cached
+	writeBytes       expvar.Int           // counter_guestbd_write_bytes
+	writePages       expvar.Int           // counter_guestbd_write_pages
+	readSizeHist     *metrics.Histogram   // histogram_guestbd_read_size_bytes
+	writeSizeHist    *metrics.Histogram   // histogram_guestbd_write_size_bytes
+	baseImagesActive expvar.Int           // gauge_guestbd_base_images_active
+	baseImagesCached expvar.Int           // gauge_guestbd_base_images_cached
 }
 
 // NewServer creates a new guestbd server.
@@ -44,15 +46,23 @@ func NewServer(filePath string, pageSize int, maxMem int64) *Server {
 		maxPages = 1
 	}
 
+	// Powers of two from 1 to 4MB.
+	var sizeBuckets []float64
+	for v := float64(1); v <= 4*1024*1024; v *= 2 {
+		sizeBuckets = append(sizeBuckets, v)
+	}
+
 	srv := &Server{
 		filePath:      filePath,
 		pageSize:      pageSize,
 		zeroPageHash:  hashPage(make([]byte, pageSize)),
 		cache:         newPageCache(maxPages, pageSize),
 		readonlyFiles: make(map[inodeKey]*readonlyFile),
-		conns:    make(set.Set[*Conn]),
-		ops:      metrics.LabelMap{Label: "type"},
-		readPath: metrics.LabelMap{Label: "type"},
+		conns:         make(set.Set[*Conn]),
+		ops:           metrics.LabelMap{Label: "type"},
+		readPath:      metrics.LabelMap{Label: "type"},
+		readSizeHist:  metrics.NewHistogram(sizeBuckets),
+		writeSizeHist: metrics.NewHistogram(sizeBuckets),
 	}
 
 	return srv
@@ -69,6 +79,8 @@ func (s *Server) initExpvar() {
 	expvar.Publish("counter_guestbd_read_pages", &s.readPages)
 	expvar.Publish("counter_guestbd_write_bytes", &s.writeBytes)
 	expvar.Publish("counter_guestbd_write_pages", &s.writePages)
+	expvar.Publish("histogram_guestbd_read_size_bytes", s.readSizeHist)
+	expvar.Publish("histogram_guestbd_write_size_bytes", s.writeSizeHist)
 	expvar.Publish("counter_guestbd_cache", &s.cache.path)
 	expvar.Publish("gauge_guestbd_cache_entries", &s.cache.entries)
 	expvar.Publish("gauge_guestbd_cache_bytes", &s.cache.bytes)
@@ -319,6 +331,7 @@ func (s *Server) serveTransmission(c *Conn) error {
 		switch req.Type {
 		case nbdCmdRead:
 			s.ops.Add("read", 1)
+			s.readSizeHist.Observe(float64(req.Length))
 			data, err := c.handleRead(req.Offset, uint64(req.Length))
 			if err != nil {
 				if werr := s.sendReply(rw, req.Handle, nbdEIO, nil); werr != nil {
@@ -332,6 +345,7 @@ func (s *Server) serveTransmission(c *Conn) error {
 
 		case nbdCmdWrite:
 			s.ops.Add("write", 1)
+			s.writeSizeHist.Observe(float64(req.Length))
 			data := make([]byte, req.Length)
 			if _, err := io.ReadFull(rw, data); err != nil {
 				return fmt.Errorf("reading write data: %w", err)
