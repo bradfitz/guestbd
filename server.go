@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"sync"
 
 	"tailscale.com/metrics"
@@ -92,6 +93,22 @@ func (s *Server) initExpvar() {
 	ps := new(expvar.Int)
 	ps.Set(int64(s.pageSize))
 	expvar.Publish("gauge_guestbd_page_size", ps)
+
+	expvar.Publish("gauge_guestbd_max_dirty_bytes", expvar.Func(func() any {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		var max int64
+		for c := range s.conns {
+			c.mu.Lock()
+			n := int64(len(c.dirtyPages)) * int64(s.pageSize)
+			c.mu.Unlock()
+			if n > max {
+				max = n
+			}
+		}
+		return max
+	}))
 }
 
 // getReadonlyFile returns the readonlyFile for the backing file,
@@ -334,6 +351,8 @@ func (s *Server) serveNBD(c *Conn) error {
 
 // serveTransmission handles the NBD transmission phase.
 func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error {
+	var buf []byte
+
 	for {
 		var req nbdRequest
 		if err := binary.Read(r, binary.BigEndian, &req); err != nil {
@@ -354,8 +373,8 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 		case nbdCmdRead:
 			s.ops.Add("read", 1)
 			s.readSizeHist.Observe(float64(req.Length))
-			data, err := c.handleRead(req.Offset, uint64(req.Length))
-			if err != nil {
+			buf = slices.Grow(buf[:0], int(req.Length))[:req.Length]
+			if err := c.handleRead(buf, req.Offset); err != nil {
 				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
 					return werr
 				}
@@ -364,7 +383,7 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 				}
 				continue
 			}
-			if err := s.sendReply(bw, req.Handle, 0, data); err != nil {
+			if err := s.sendReply(bw, req.Handle, 0, buf); err != nil {
 				return err
 			}
 			if err := bw.Flush(); err != nil {
@@ -374,11 +393,11 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 		case nbdCmdWrite:
 			s.ops.Add("write", 1)
 			s.writeSizeHist.Observe(float64(req.Length))
-			data := make([]byte, req.Length)
-			if _, err := io.ReadFull(r, data); err != nil {
+			buf = slices.Grow(buf[:0], int(req.Length))[:req.Length]
+			if _, err := io.ReadFull(r, buf); err != nil {
 				return fmt.Errorf("reading write data: %w", err)
 			}
-			if err := c.handleWrite(req.Offset, data); err != nil {
+			if err := c.handleWrite(req.Offset, buf); err != nil {
 				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
 					return werr
 				}

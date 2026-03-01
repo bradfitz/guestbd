@@ -96,11 +96,11 @@ func (c *Conn) readPageData(pageNum int64) ([]byte, error) {
 }
 
 // handleRead handles an NBD read request, assembling data from
-// potentially multiple pages.
-func (c *Conn) handleRead(offset, length uint64) ([]byte, error) {
+// potentially multiple pages into dst.
+func (c *Conn) handleRead(dst []byte, offset uint64) error {
+	length := uint64(len(dst))
 	c.server.readBytes.Add(int64(length))
 
-	result := make([]byte, length)
 	pageSize := uint64(c.server.pageSize)
 
 	pos := uint64(0)
@@ -111,17 +111,17 @@ func (c *Conn) handleRead(offset, length uint64) ([]byte, error) {
 
 		pageData, err := c.readPageData(pageNum)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		n := pageSize - pageOffset
 		if n > length-pos {
 			n = length - pos
 		}
-		copy(result[pos:pos+n], pageData[pageOffset:pageOffset+n])
+		copy(dst[pos:pos+n], pageData[pageOffset:pageOffset+n])
 		pos += n
 	}
-	return result, nil
+	return nil
 }
 
 // handleWrite handles an NBD write request. Sub-page writes trigger

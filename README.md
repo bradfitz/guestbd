@@ -96,6 +96,7 @@ tailscale.com/metrics's LabelMap and Histogram types.
 | `guestbd_base_images_active` | readonlyFile entries with active connections |
 | `guestbd_base_images_cached` | readonlyFile entries in memory (including idle) |
 | `guestbd_page_size` | Configured page size |
+| `guestbd_max_dirty_bytes` | Dirty page bytes of the connection with the most dirty pages |
 
 #### Histograms
 
