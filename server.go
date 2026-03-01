@@ -18,27 +18,27 @@ import (
 
 // Server is the main guestbd NBD server.
 type Server struct {
-	mu            sync.Mutex
-	filePath      string
-	pageSize      int
-	zeroPageHash  pageHash // sha256 of a page filled entirely with zero bytes
-	cache         *pageCache
+	mu           sync.Mutex
+	filePath     string
+	pageSize     int
+	zeroPageHash pageHash // sha256 of a page filled entirely with zero bytes
+	cache        *pageCache
 
 	readonlyFiles map[inodeKey]*readonlyFile
 	conns         set.Set[*Conn]
 
-	totalConns  expvar.Int       // counter_guestbd_total_conns
-	activeConns expvar.Int       // gauge_guestbd_active_conns
-	ops         metrics.LabelMap // counter_guestbd_nbd_ops{type=...}
-	readPath    metrics.LabelMap // counter_guestbd_read_path{type=...}
-	readBytes   expvar.Int       // counter_guestbd_read_bytes
-	readPages   expvar.Int       // counter_guestbd_read_pages
-	writeBytes       expvar.Int           // counter_guestbd_write_bytes
-	writePages       expvar.Int           // counter_guestbd_write_pages
-	readSizeHist     *metrics.Histogram   // histogram_guestbd_read_size_bytes
-	writeSizeHist    *metrics.Histogram   // histogram_guestbd_write_size_bytes
-	baseImagesActive expvar.Int           // gauge_guestbd_base_images_active
-	baseImagesCached expvar.Int           // gauge_guestbd_base_images_cached
+	totalConns       expvar.Int         // counter_guestbd_total_conns
+	activeConns      expvar.Int         // gauge_guestbd_active_conns
+	ops              metrics.LabelMap   // counter_guestbd_nbd_ops{type=...}
+	readPath         metrics.LabelMap   // counter_guestbd_read_path{type=...}
+	readBytes        expvar.Int         // counter_guestbd_read_bytes
+	readPages        expvar.Int         // counter_guestbd_read_pages
+	writeBytes       expvar.Int         // counter_guestbd_write_bytes
+	writePages       expvar.Int         // counter_guestbd_write_pages
+	readSizeHist     *metrics.Histogram // histogram_guestbd_read_size_bytes
+	writeSizeHist    *metrics.Histogram // histogram_guestbd_write_size_bytes
+	baseImagesActive expvar.Int         // gauge_guestbd_base_images_active
+	baseImagesCached expvar.Int         // gauge_guestbd_base_images_cached
 }
 
 // NewServer creates a new guestbd server.
@@ -145,7 +145,7 @@ func (s *Server) getReadonlyFile() (*readonlyFile, error) {
 
 	ro := newReadonlyFile(s, f, fi.Size())
 	s.readonlyFiles[key] = ro
-	s.baseImagesActive.Add(1)  // new entry starts with refcount 1
+	s.baseImagesActive.Add(1) // new entry starts with refcount 1
 	s.baseImagesCached.Add(1)
 	return ro, nil
 }
