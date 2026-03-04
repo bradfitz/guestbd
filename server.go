@@ -10,8 +10,10 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 
+	"github.com/bradfitz/qcow2"
 	"tailscale.com/metrics"
 	"tailscale.com/util/set"
 )
@@ -143,7 +145,21 @@ func (s *Server) getReadonlyFile() (*readonlyFile, error) {
 		return ro, nil
 	}
 
-	ro := newReadonlyFile(s, f, fi.Size())
+	var reader io.ReaderAt
+	size := fi.Size()
+	if strings.HasSuffix(s.filePath, ".qcow2") {
+		img, err := qcow2.Open(f)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("opening qcow2 image: %w", err)
+		}
+		reader = img
+		size = img.Size()
+	} else {
+		reader = f
+	}
+
+	ro := newReadonlyFile(s, f, size, reader)
 	s.readonlyFiles[key] = ro
 	s.baseImagesActive.Add(1) // new entry starts with refcount 1
 	s.baseImagesCached.Add(1)

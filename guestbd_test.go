@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -252,7 +254,13 @@ func startTestServer(t *testing.T, fileData []byte, pageSize int) (addr string, 
 	}
 	tmpFile.Close()
 
-	srv = NewServer(tmpFile.Name(), pageSize, int64(pageSize)*256)
+	return startTestServerFile(t, tmpFile.Name(), pageSize)
+}
+
+func startTestServerFile(t *testing.T, filePath string, pageSize int) (addr string, srv *Server, cleanup func()) {
+	t.Helper()
+
+	srv = NewServer(filePath, pageSize, int64(pageSize)*256)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -271,7 +279,7 @@ func startTestServer(t *testing.T, fileData []byte, pageSize int) (addr string, 
 
 	return ln.Addr().String(), srv, func() {
 		ln.Close()
-		os.Remove(tmpFile.Name())
+		os.Remove(filePath)
 	}
 }
 
@@ -883,5 +891,80 @@ func TestMultiplePageSizes(t *testing.T) {
 				t.Fatal("sub-page write mismatch")
 			}
 		})
+	}
+}
+
+func TestQcow2BaseImage(t *testing.T) {
+	qemuImg, err := exec.LookPath("qemu-img")
+	if err != nil {
+		t.Skip("qemu-img not found")
+	}
+
+	const pageSize = 4096
+	const diskSize = pageSize * 4 // 16KB virtual disk
+
+	// Create a raw image with known data.
+	dir := t.TempDir()
+	rawPath := filepath.Join(dir, "test.raw")
+	data := make([]byte, diskSize)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	if err := os.WriteFile(rawPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Convert to qcow2.
+	qcow2Path := filepath.Join(dir, "test.qcow2")
+	out, err := exec.Command(qemuImg, "convert", "-f", "raw", "-O", "qcow2", rawPath, qcow2Path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("qemu-img convert: %v\n%s", err, out)
+	}
+
+	addr, _, cleanup := startTestServerFile(t, qcow2Path, pageSize)
+	defer cleanup()
+
+	c := newTestClient(t, addr)
+	defer c.disconnect()
+
+	if c.exportSize != uint64(diskSize) {
+		t.Fatalf("export size: got %d, want %d", c.exportSize, diskSize)
+	}
+
+	// Read full first page.
+	got := c.read(0, pageSize)
+	if !bytes.Equal(got, data[:pageSize]) {
+		t.Fatal("first page mismatch")
+	}
+
+	// Read across page boundary.
+	off := uint64(pageSize - 100)
+	got = c.read(off, 200)
+	if !bytes.Equal(got, data[off:off+200]) {
+		t.Fatal("cross-page read mismatch")
+	}
+
+	// Read last page.
+	off = uint64(pageSize * 3)
+	got = c.read(off, pageSize)
+	if !bytes.Equal(got, data[off:off+pageSize]) {
+		t.Fatal("last page mismatch")
+	}
+
+	// Write and read back (ephemeral write on top of qcow2 base).
+	writeData := make([]byte, pageSize)
+	for i := range writeData {
+		writeData[i] = 0xAB
+	}
+	c.write(0, writeData)
+	got = c.read(0, pageSize)
+	if !bytes.Equal(got, writeData) {
+		t.Fatal("write on qcow2 mismatch")
+	}
+
+	// Second page should still be original.
+	got = c.read(pageSize, pageSize)
+	if !bytes.Equal(got, data[pageSize:2*pageSize]) {
+		t.Fatal("unwritten page should still be original qcow2 data")
 	}
 }

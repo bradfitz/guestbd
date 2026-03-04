@@ -23,8 +23,9 @@ func fileInodeKey(fi os.FileInfo) inodeKey {
 type readonlyFile struct {
 	srv      *Server
 	mu       sync.Mutex
-	f        *os.File
-	size     int64
+	f        *os.File     // underlying file (for Stat, Close)
+	reader   io.ReaderAt  // used for page reads (may be *os.File or *qcow2.Image)
+	size     int64        // virtual size (file size for raw, virtual disk size for qcow2)
 	refcount int32
 
 	// pageHashes is lazily computed per page.
@@ -33,12 +34,13 @@ type readonlyFile struct {
 	pageHashes []pageHash
 }
 
-func newReadonlyFile(srv *Server, f *os.File, size int64) *readonlyFile {
+func newReadonlyFile(srv *Server, f *os.File, size int64, reader io.ReaderAt) *readonlyFile {
 	pageSize := srv.pageSize
 	numPages := (size + int64(pageSize) - 1) / int64(pageSize)
 	return &readonlyFile{
 		srv:        srv,
 		f:          f,
+		reader:     reader,
 		size:       size,
 		refcount:   1,
 		pageHashes: make([]pageHash, numPages),
@@ -82,7 +84,7 @@ func (r *readonlyFile) readPage(n int64) (data []byte, hash pageHash, result rea
 	// Need to read from disk.
 	buf := make([]byte, pageSize)
 	offset := n * int64(pageSize)
-	nr, readErr := r.f.ReadAt(buf, offset)
+	nr, readErr := r.reader.ReadAt(buf, offset)
 	if readErr != nil && readErr != io.EOF {
 		return nil, pageHash{}, 0, readErr
 	}
