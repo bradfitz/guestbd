@@ -4,6 +4,11 @@ guestbd is a userspace NBD server that gives each TCP connection its own virtual
 read/write namespace on top of a given file on disk that's only read-only. Then
 the TCP connection breaks, any writes that were made by that client are lost.
 
+Both raw disk images and qcow2 images are supported. Files ending in `.qcow2`
+are automatically opened as qcow2 (with support for deflate and zstd
+compression). qcow2 support is provided by
+[github.com/bradfitz/qcow2](https://pkg.go.dev/github.com/bradfitz/qcow2).
+
 This is meant for the being the root block device for short-lived ephemeral CI
 workload VMs, where we prefer speed over any sort of durability.
 

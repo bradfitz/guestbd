@@ -14,7 +14,7 @@ import (
 
 var (
 	flagListen   = flag.String("listen", ":10809", "NBD listen address")
-	flagFile     = flag.String("file", "", "path to the backing file to serve")
+	flagFile     = flag.String("file", "", "path to the backing file to serve; files are treated as raw files, unless filename ends in .qcow2")
 	flagPageSize = flag.Int("page-size", 4096, "page size in bytes (must be a power of two)")
 	flagMaxMem   = flag.Int64("max-mem", 1<<30, "maximum memory for page cache in bytes")
 	flagDebug    = flag.String("debug-addr", ":8080", "debug HTTP listen address")

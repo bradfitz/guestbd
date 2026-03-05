@@ -23,9 +23,9 @@ func fileInodeKey(fi os.FileInfo) inodeKey {
 type readonlyFile struct {
 	srv      *Server
 	mu       sync.Mutex
-	f        *os.File     // underlying file (for Stat, Close)
-	reader   io.ReaderAt  // used for page reads (may be *os.File or *qcow2.Image)
-	size     int64        // virtual size (file size for raw, virtual disk size for qcow2)
+	f        *os.File    // underlying file (for Stat, Close)
+	reader   io.ReaderAt // used for page reads (may be *os.File or *qcow2.Image)
+	size     int64       // virtual size (file size for raw, virtual disk size for qcow2)
 	refcount int32
 
 	// pageHashes is lazily computed per page.
