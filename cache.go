@@ -1,4 +1,4 @@
-package main
+package guestbd
 
 import (
 	"bytes"
@@ -14,6 +14,7 @@ import (
 // A zero value means the page has not been read from disk yet.
 type pageHash [sha256.Size]byte
 
+// hashPage returns the SHA-256 hash of data.
 func hashPage(data []byte) pageHash {
 	return sha256.Sum256(data)
 }
@@ -33,11 +34,15 @@ type pageCache struct {
 	bytes   expvar.Int       // gauge_guestbd_cache_bytes
 }
 
+// cacheEntry is a single element in the LRU list, pairing a page hash with
+// its data.
 type cacheEntry struct {
 	hash pageHash
 	data []byte
 }
 
+// newPageCache returns a new page cache that holds at most maxPages pages of
+// the given pageSize.
 func newPageCache(maxPages, pageSize int) *pageCache {
 	return &pageCache{
 		maxPages: maxPages,
@@ -84,6 +89,7 @@ func (c *pageCache) Put(h pageHash, data []byte) {
 	}
 }
 
+// evict removes the least recently used entry from the cache.
 func (c *pageCache) evict() {
 	elem := c.lru.Back()
 	if elem == nil {

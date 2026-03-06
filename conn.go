@@ -1,4 +1,4 @@
-package main
+package guestbd
 
 import (
 	"fmt"
@@ -28,6 +28,8 @@ type dirtyPageInfo struct {
 	dirtyNum int // index into the connection's dirtyFile
 }
 
+// newConn creates a new Conn for the given TCP connection and read-only
+// backing file. It creates an unlinked temporary file for dirty page storage.
 func newConn(srv *Server, tc net.Conn, ro *readonlyFile) (*Conn, error) {
 	tmpFile, err := os.CreateTemp("", "guestbd-dirty-*")
 	if err != nil {
@@ -45,6 +47,8 @@ func newConn(srv *Server, tc net.Conn, ro *readonlyFile) (*Conn, error) {
 	}, nil
 }
 
+// Close releases the connection's dirty page storage. It does not close the
+// underlying TCP connection.
 func (c *Conn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

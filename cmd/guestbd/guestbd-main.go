@@ -1,3 +1,7 @@
+// Command guestbd runs a guestbd NBD server. It listens for NBD client
+// connections over TCP and serves a backing file (raw or qcow2) with
+// per-connection ephemeral writes. It also runs a debug HTTP server
+// exposing expvar metrics and pprof endpoints.
 package main
 
 import (
@@ -9,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/bradfitz/guestbd"
 	"tailscale.com/tsweb"
 )
 
@@ -30,8 +35,8 @@ func main() {
 		log.Fatal("--page-size must be a positive power of two")
 	}
 
-	srv := NewServer(*flagFile, *flagPageSize, *flagMaxMem)
-	srv.initExpvar()
+	srv := guestbd.NewServer(*flagFile, *flagPageSize, *flagMaxMem)
+	srv.InitExpvar()
 
 	// Debug HTTP server with tsweb.
 	debugMux := http.NewServeMux()
@@ -58,15 +63,7 @@ func main() {
 		ln.Close()
 	}()
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			log.Printf("accept: %v", err)
-			continue
-		}
-		go srv.HandleConn(conn)
+	if err := srv.Serve(ln); err != nil && ctx.Err() == nil {
+		log.Fatalf("serve: %v", err)
 	}
 }

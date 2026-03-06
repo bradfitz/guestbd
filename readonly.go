@@ -1,4 +1,4 @@
-package main
+package guestbd
 
 import (
 	"io"
@@ -13,6 +13,8 @@ type inodeKey struct {
 	ino uint64
 }
 
+// fileInodeKey returns the inodeKey for the given FileInfo by extracting the
+// device and inode numbers from its underlying syscall.Stat_t.
 func fileInodeKey(fi os.FileInfo) inodeKey {
 	stat := fi.Sys().(*syscall.Stat_t)
 	return inodeKey{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}
@@ -34,6 +36,8 @@ type readonlyFile struct {
 	pageHashes []pageHash
 }
 
+// newReadonlyFile creates a new readonlyFile with a pre-allocated pageHashes
+// table sized for the given virtual disk size. The refcount starts at 1.
 func newReadonlyFile(srv *Server, f *os.File, size int64, reader io.ReaderAt) *readonlyFile {
 	pageSize := srv.pageSize
 	numPages := (size + int64(pageSize) - 1) / int64(pageSize)

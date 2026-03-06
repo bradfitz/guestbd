@@ -1,4 +1,4 @@
-package main
+package guestbd
 
 import (
 	"bufio"
@@ -18,7 +18,9 @@ import (
 	"tailscale.com/util/set"
 )
 
-// Server is the main guestbd NBD server.
+// Server is an NBD server that serves a single backing file to multiple
+// concurrent clients. Each client connection gets an independent copy-on-write
+// layer; writes are ephemeral and discarded on disconnect.
 type Server struct {
 	mu           sync.Mutex
 	filePath     string
@@ -43,7 +45,11 @@ type Server struct {
 	baseImagesCached expvar.Int         // gauge_guestbd_base_images_cached
 }
 
-// NewServer creates a new guestbd server.
+// NewServer creates a new Server that serves the file at filePath.
+// Files ending in ".qcow2" are opened as qcow2 images; all others are
+// treated as raw disk images.
+// The pageSize must be a positive power of two (commonly 4096).
+// The maxMem parameter controls the maximum memory used by the shared page cache.
 func NewServer(filePath string, pageSize int, maxMem int64) *Server {
 	maxPages := int(maxMem) / pageSize
 	if maxPages < 1 {
@@ -72,9 +78,10 @@ func NewServer(filePath string, pageSize int, maxMem int64) *Server {
 	return srv
 }
 
-// initExpvar publishes the server's metrics to expvar.
-// Called once from main; not called in tests to avoid duplicate registration panics.
-func (s *Server) initExpvar() {
+// InitExpvar publishes the server's metrics to expvar. It should be called
+// once before serving. It is not called in tests to avoid duplicate
+// registration panics.
+func (s *Server) InitExpvar() {
 	expvar.Publish("counter_guestbd_total_conns", &s.totalConns)
 	expvar.Publish("gauge_guestbd_active_conns", &s.activeConns)
 	expvar.Publish("counter_guestbd_nbd_ops", &s.ops)
@@ -199,6 +206,19 @@ func (s *Server) releaseReadonlyFile(ro *readonlyFile) {
 		s.mu.Unlock()
 		ro.f.Close()
 		s.baseImagesCached.Add(-1)
+	}
+}
+
+// Serve accepts incoming connections on the listener ln, handling
+// each one on a new goroutine. Serve blocks until the listener
+// returns an error. The caller is responsible for closing ln.
+func (s *Server) Serve(ln net.Listener) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go s.HandleConn(conn)
 	}
 }
 
@@ -465,6 +485,8 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 	}
 }
 
+// sendOptReply writes an NBD option reply with the given option code, reply
+// type, and optional payload data.
 func (s *Server) sendOptReply(w io.Writer, optCode uint32, replyType uint32, data []byte) error {
 	var header [20]byte
 	binary.BigEndian.PutUint64(header[0:8], nbdOptReplyMagic)
@@ -482,6 +504,8 @@ func (s *Server) sendOptReply(w io.Writer, optCode uint32, replyType uint32, dat
 	return nil
 }
 
+// sendReply writes an NBD transmission-phase reply with the given handle,
+// error code, and optional payload data.
 func (s *Server) sendReply(w io.Writer, handle uint64, errCode uint32, data []byte) error {
 	var header [16]byte
 	binary.BigEndian.PutUint32(header[0:4], nbdReplyMagic)

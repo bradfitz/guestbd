@@ -1,4 +1,4 @@
-package main
+package guestbd
 
 // NBD protocol constants.
 // See https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md
