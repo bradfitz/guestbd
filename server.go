@@ -18,9 +18,39 @@ import (
 	"tailscale.com/util/set"
 )
 
+// ServerOption configures optional Server parameters.
+type ServerOption func(*serverConfig)
+
+type serverConfig struct {
+	pageSize       int
+	maxMem         int64
+	sharedSnapshot bool
+}
+
+// WithPageSize sets the page size in bytes. It must be a positive power of two.
+// The default is 4096.
+func WithPageSize(n int) ServerOption {
+	return func(c *serverConfig) { c.pageSize = n }
+}
+
+// WithMaxMem sets the maximum memory used by the shared page cache.
+// The default is 1GB.
+func WithMaxMem(n int64) ServerOption {
+	return func(c *serverConfig) { c.maxMem = n }
+}
+
+// WithSharedSnapshot makes all connections share a single writable Snapshot
+// instead of each getting its own. This allows reconnecting clients to see
+// writes from previous connections.
+func WithSharedSnapshot() ServerOption {
+	return func(c *serverConfig) { c.sharedSnapshot = true }
+}
+
 // Server is an NBD server that serves a single backing file to multiple
-// concurrent clients. Each client connection gets an independent copy-on-write
-// layer; writes are ephemeral and discarded on disconnect.
+// concurrent clients. Each client connection may get an independent
+// copy-on-write Snapshot, or multiple connections may share a single Snapshot
+// to allow reconnection to a previous writable state. The snapshot policy is
+// configured via WithSharedSnapshot at construction time.
 type Server struct {
 	mu           sync.Mutex
 	filePath     string
@@ -28,8 +58,11 @@ type Server struct {
 	zeroPageHash pageHash // sha256 of a page filled entirely with zero bytes
 	cache        *pageCache
 
+	useSharedSnapshot bool      // set by WithSharedSnapshot
+	sharedSnap        *Snapshot // lazily created when useSharedSnapshot is true
+
 	readonlyFiles map[inodeKey]*readonlyFile
-	conns         set.Set[*Conn]
+	snapshots     set.Set[*Snapshot]
 
 	totalConns       expvar.Int         // counter_guestbd_total_conns
 	activeConns      expvar.Int         // gauge_guestbd_active_conns
@@ -48,10 +81,17 @@ type Server struct {
 // NewServer creates a new Server that serves the file at filePath.
 // Files ending in ".qcow2" are opened as qcow2 images; all others are
 // treated as raw disk images.
-// The pageSize must be a positive power of two (commonly 4096).
-// The maxMem parameter controls the maximum memory used by the shared page cache.
-func NewServer(filePath string, pageSize int, maxMem int64) *Server {
-	maxPages := int(maxMem) / pageSize
+func NewServer(filePath string, opts ...ServerOption) *Server {
+	cfg := serverConfig{
+		pageSize: 4096,
+		maxMem:   1 << 30, // 1GB default
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	pageSize := cfg.pageSize
+	maxPages := int(cfg.maxMem) / pageSize
 	if maxPages < 1 {
 		maxPages = 1
 	}
@@ -63,16 +103,17 @@ func NewServer(filePath string, pageSize int, maxMem int64) *Server {
 	}
 
 	srv := &Server{
-		filePath:      filePath,
-		pageSize:      pageSize,
-		zeroPageHash:  hashPage(make([]byte, pageSize)),
-		cache:         newPageCache(maxPages, pageSize),
-		readonlyFiles: make(map[inodeKey]*readonlyFile),
-		conns:         make(set.Set[*Conn]),
-		ops:           metrics.LabelMap{Label: "type"},
-		readPath:      metrics.LabelMap{Label: "type"},
-		readSizeHist:  metrics.NewHistogram(sizeBuckets),
-		writeSizeHist: metrics.NewHistogram(sizeBuckets),
+		filePath:          filePath,
+		pageSize:          pageSize,
+		useSharedSnapshot: cfg.sharedSnapshot,
+		zeroPageHash:      hashPage(make([]byte, pageSize)),
+		cache:             newPageCache(maxPages, pageSize),
+		readonlyFiles:     make(map[inodeKey]*readonlyFile),
+		snapshots:         make(set.Set[*Snapshot]),
+		ops:               metrics.LabelMap{Label: "type"},
+		readPath:          metrics.LabelMap{Label: "type"},
+		readSizeHist:      metrics.NewHistogram(sizeBuckets),
+		writeSizeHist:     metrics.NewHistogram(sizeBuckets),
 	}
 
 	return srv
@@ -108,7 +149,7 @@ func (s *Server) InitExpvar() {
 		defer s.mu.Unlock()
 
 		var max int64
-		for c := range s.conns {
+		for c := range s.snapshots {
 			c.mu.Lock()
 			n := int64(len(c.dirtyPages)) * int64(s.pageSize)
 			c.mu.Unlock()
@@ -209,6 +250,74 @@ func (s *Server) releaseReadonlyFile(ro *readonlyFile) {
 	}
 }
 
+// NewSnapshot creates a new writable Snapshot backed by the server's base
+// image. The caller is responsible for calling Close when the snapshot is no
+// longer needed.
+func (s *Server) NewSnapshot() (*Snapshot, error) {
+	ro, err := s.getReadonlyFile()
+	if err != nil {
+		return nil, fmt.Errorf("opening base image: %w", err)
+	}
+	snap, err := newSnapshot(s, ro)
+	if err != nil {
+		s.releaseReadonlyFile(ro)
+		return nil, err
+	}
+	s.mu.Lock()
+	s.snapshots.Add(snap)
+	s.mu.Unlock()
+	return snap, nil
+}
+
+// Close cleans up server resources, including any shared Snapshot created
+// via WithSharedSnapshot.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	snap := s.sharedSnap
+	s.sharedSnap = nil
+	s.mu.Unlock()
+	if snap != nil {
+		snap.Close()
+	}
+	return nil
+}
+
+// getOrCreateSnapshot returns a snapshot for a new connection. If the server
+// is configured with WithSharedSnapshot, it lazily creates a single shared
+// snapshot and returns it with owned=false. Otherwise it creates a fresh
+// per-connection snapshot with owned=true. The caller must close the snapshot
+// when owned is true.
+func (s *Server) getOrCreateSnapshot() (snap *Snapshot, owned bool, err error) {
+	if !s.useSharedSnapshot {
+		snap, err = s.NewSnapshot()
+		return snap, true, err
+	}
+
+	s.mu.Lock()
+	snap = s.sharedSnap
+	s.mu.Unlock()
+	if snap != nil {
+		return snap, false, nil
+	}
+
+	// Lazy creation; must not hold s.mu across NewSnapshot.
+	snap, err = s.NewSnapshot()
+	if err != nil {
+		return nil, false, err
+	}
+
+	s.mu.Lock()
+	if s.sharedSnap != nil {
+		// Another goroutine created it first.
+		s.mu.Unlock()
+		snap.Close()
+		return s.sharedSnap, false, nil
+	}
+	s.sharedSnap = snap
+	s.mu.Unlock()
+	return snap, false, nil
+}
+
 // Serve accepts incoming connections on the listener ln, handling
 // each one on a new goroutine. Serve blocks until the listener
 // returns an error. The caller is responsible for closing ln.
@@ -223,49 +332,36 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // HandleConn handles a new TCP connection, performing the NBD
-// handshake and entering the transmission phase.
+// handshake and entering the transmission phase. The snapshot policy
+// (per-connection or shared) is determined by the server's configuration.
 func (s *Server) HandleConn(nc net.Conn) {
 	s.totalConns.Add(1)
 	s.activeConns.Add(1)
 	defer s.activeConns.Add(-1)
 
-	ro, err := s.getReadonlyFile()
+	snap, owned, err := s.getOrCreateSnapshot()
 	if err != nil {
-		log.Printf("open backing file for %v: %v", nc.RemoteAddr(), err)
+		log.Printf("create snapshot for %v: %v", nc.RemoteAddr(), err)
 		nc.Close()
 		return
 	}
-
-	c, err := newConn(s, nc, ro)
-	if err != nil {
-		log.Printf("create conn for %v: %v", nc.RemoteAddr(), err)
-		s.releaseReadonlyFile(ro)
-		nc.Close()
-		return
-	}
-
-	s.mu.Lock()
-	s.conns.Add(c)
-	s.mu.Unlock()
 
 	defer func() {
-		s.mu.Lock()
-		s.conns.Delete(c)
-		s.mu.Unlock()
-		c.Close()
-		s.releaseReadonlyFile(ro)
+		if owned {
+			snap.Close()
+		}
 		nc.Close()
 	}()
 
-	if err := s.serveNBD(c); err != nil {
+	if err := s.serveNBD(snap, nc); err != nil {
 		log.Printf("nbd %v: %v", nc.RemoteAddr(), err)
 	}
 }
 
 // serveNBD runs the NBD protocol on the given connection.
-func (s *Server) serveNBD(c *Conn) error {
-	r := c.tcpConn
-	bw := bufio.NewWriterSize(c.tcpConn, 1<<20) // 1MB
+func (s *Server) serveNBD(snap *Snapshot, nc net.Conn) error {
+	r := nc
+	bw := bufio.NewWriterSize(nc, 1<<20) // 1MB
 
 	// Phase 1: Newstyle handshake.
 	var handshake [18]byte
@@ -287,7 +383,7 @@ func (s *Server) serveNBD(c *Conn) error {
 	noZeroes := cflags&nbdFlagCNoZeroes != 0
 
 	// Phase 2: Option haggling.
-	exportSize := uint64(c.roFile.size)
+	exportSize := uint64(snap.roFile.size)
 	txFlags := nbdFlagHasFlags | nbdFlagSendFlush | nbdFlagSendTrim
 
 	for {
@@ -326,7 +422,7 @@ func (s *Server) serveNBD(c *Conn) error {
 			if err := bw.Flush(); err != nil {
 				return err
 			}
-			return s.serveTransmission(c, r, bw)
+			return s.serveTransmission(snap, r, bw)
 
 		case nbdOptAbort:
 			if err := s.sendOptReply(bw, optCode, nbdRepAck, nil); err != nil {
@@ -359,7 +455,7 @@ func (s *Server) serveNBD(c *Conn) error {
 			if err := bw.Flush(); err != nil {
 				return err
 			}
-			return s.serveTransmission(c, r, bw)
+			return s.serveTransmission(snap, r, bw)
 
 		case nbdOptList:
 			// One export with empty name (default).
@@ -386,7 +482,7 @@ func (s *Server) serveNBD(c *Conn) error {
 }
 
 // serveTransmission handles the NBD transmission phase.
-func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error {
+func (s *Server) serveTransmission(snap *Snapshot, r io.Reader, bw *bufio.Writer) error {
 	var buf []byte
 
 	for {
@@ -410,7 +506,7 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 			s.ops.Add("read", 1)
 			s.readSizeHist.Observe(float64(req.Length))
 			buf = slices.Grow(buf[:0], int(req.Length))[:req.Length]
-			if err := c.handleRead(buf, req.Offset); err != nil {
+			if _, err := snap.ReadAt(buf, int64(req.Offset)); err != nil {
 				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
 					return werr
 				}
@@ -433,7 +529,7 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 			if _, err := io.ReadFull(r, buf); err != nil {
 				return fmt.Errorf("reading write data: %w", err)
 			}
-			if err := c.handleWrite(req.Offset, buf); err != nil {
+			if _, err := snap.WriteAt(buf, int64(req.Offset)); err != nil {
 				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
 					return werr
 				}
@@ -466,7 +562,7 @@ func (s *Server) serveTransmission(c *Conn, r io.Reader, bw *bufio.Writer) error
 
 		case nbdCmdTrim:
 			s.ops.Add("trim", 1)
-			c.handleTrim(req.Offset, uint64(req.Length))
+			snap.handleTrim(req.Offset, uint64(req.Length))
 			if err := s.sendReply(bw, req.Handle, 0, nil); err != nil {
 				return err
 			}

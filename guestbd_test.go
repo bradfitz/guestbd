@@ -260,7 +260,7 @@ func startTestServer(t *testing.T, fileData []byte, pageSize int) (addr string, 
 func startTestServerFile(t *testing.T, filePath string, pageSize int) (addr string, srv *Server, cleanup func()) {
 	t.Helper()
 
-	srv = NewServer(filePath, pageSize, int64(pageSize)*256)
+	srv = NewServer(filePath, WithPageSize(pageSize), WithMaxMem(int64(pageSize)*256))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -751,7 +751,7 @@ func BenchmarkRead(b *testing.B) {
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
 
-	srv := NewServer(tmpFile.Name(), pageSize, int64(pageSize)*256)
+	srv := NewServer(tmpFile.Name(), WithPageSize(pageSize), WithMaxMem(int64(pageSize)*256))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

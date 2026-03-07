@@ -2,19 +2,26 @@ package guestbd
 
 import (
 	"fmt"
-	"net"
+	"io"
 	"os"
 	"sync"
 )
 
-// Conn represents a single NBD client connection.
-// Each connection has its own virtual read/write namespace:
-// reads fall through to the shared readonlyFile, while writes
-// are tracked per-connection and lost on disconnect.
-type Conn struct {
-	server  *Server
-	tcpConn net.Conn
-	roFile  *readonlyFile
+// Compile-time interface checks.
+var (
+	_ io.ReaderAt = (*Snapshot)(nil)
+	_ io.WriterAt = (*Snapshot)(nil)
+)
+
+// Snapshot is a writable layer on top of a read-only base image.
+// Reads fall through to the shared base image, while writes are tracked
+// in the snapshot. A Snapshot can outlive individual TCP connections,
+// allowing reconnections to reattach to the same writable state.
+//
+// Snapshot implements io.ReaderAt and io.WriterAt.
+type Snapshot struct {
+	server *Server
+	roFile *readonlyFile
 
 	mu           sync.Mutex
 	dirtyPages   map[int64]*dirtyPageInfo // pageNum => dirty info
@@ -22,15 +29,15 @@ type Conn struct {
 	nextDirtyNum int                      // monotonically increasing
 }
 
-// dirtyPageInfo tracks a written page for a connection.
+// dirtyPageInfo tracks a written page in a snapshot.
 type dirtyPageInfo struct {
 	hash     pageHash
-	dirtyNum int // index into the connection's dirtyFile
+	dirtyNum int // index into the snapshot's dirtyFile
 }
 
-// newConn creates a new Conn for the given TCP connection and read-only
-// backing file. It creates an unlinked temporary file for dirty page storage.
-func newConn(srv *Server, tc net.Conn, ro *readonlyFile) (*Conn, error) {
+// newSnapshot creates a new Snapshot for the given read-only backing file.
+// It creates an unlinked temporary file for dirty page storage.
+func newSnapshot(srv *Server, ro *readonlyFile) (*Snapshot, error) {
 	tmpFile, err := os.CreateTemp("", "guestbd-dirty-*")
 	if err != nil {
 		return nil, fmt.Errorf("creating temp file: %w", err)
@@ -38,30 +45,35 @@ func newConn(srv *Server, tc net.Conn, ro *readonlyFile) (*Conn, error) {
 	// Unlink immediately so it's cleaned up when the fd closes.
 	os.Remove(tmpFile.Name())
 
-	return &Conn{
+	return &Snapshot{
 		server:     srv,
-		tcpConn:    tc,
 		roFile:     ro,
 		dirtyPages: make(map[int64]*dirtyPageInfo),
 		dirtyFile:  tmpFile,
 	}, nil
 }
 
-// Close releases the connection's dirty page storage. It does not close the
-// underlying TCP connection.
-func (c *Conn) Close() error {
+// Close releases the snapshot's dirty page storage and unregisters it from
+// the server. It does not close any TCP connection using the snapshot.
+func (c *Snapshot) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.dirtyFile != nil {
 		c.dirtyFile.Close()
 		c.dirtyFile = nil
 	}
+	c.mu.Unlock()
+
+	c.server.mu.Lock()
+	c.server.snapshots.Delete(c)
+	c.server.mu.Unlock()
+
+	c.server.releaseReadonlyFile(c.roFile)
 	return nil
 }
 
 // readPageData reads a full page, checking dirty pages first,
 // then falling back to the readonly file.
-func (c *Conn) readPageData(pageNum int64) ([]byte, error) {
+func (c *Snapshot) readPageData(pageNum int64) ([]byte, error) {
 	c.mu.Lock()
 	dp, dirty := c.dirtyPages[pageNum]
 	c.mu.Unlock()
@@ -74,7 +86,7 @@ func (c *Conn) readPageData(pageNum int64) ([]byte, error) {
 		if data, ok := c.server.cache.Get(dp.hash); ok {
 			return data, nil
 		}
-		// Read from the connection's dirty file.
+		// Read from the snapshot's dirty file.
 		buf := make([]byte, c.server.pageSize)
 		_, err := c.dirtyFile.ReadAt(buf, int64(dp.dirtyNum)*int64(c.server.pageSize))
 		if err != nil {
@@ -99,12 +111,13 @@ func (c *Conn) readPageData(pageNum int64) ([]byte, error) {
 	return data, nil
 }
 
-// handleRead handles an NBD read request, assembling data from
-// potentially multiple pages into dst.
-func (c *Conn) handleRead(dst []byte, offset uint64) error {
-	length := uint64(len(dst))
+// ReadAt reads len(p) bytes from the snapshot starting at byte offset off.
+// It implements io.ReaderAt.
+func (c *Snapshot) ReadAt(p []byte, off int64) (int, error) {
+	length := uint64(len(p))
 	c.server.readBytes.Add(int64(length))
 
+	offset := uint64(off)
 	pageSize := uint64(c.server.pageSize)
 
 	pos := uint64(0)
@@ -115,27 +128,29 @@ func (c *Conn) handleRead(dst []byte, offset uint64) error {
 
 		pageData, err := c.readPageData(pageNum)
 		if err != nil {
-			return err
+			return int(pos), err
 		}
 
 		n := pageSize - pageOffset
 		if n > length-pos {
 			n = length - pos
 		}
-		copy(dst[pos:pos+n], pageData[pageOffset:pageOffset+n])
+		copy(p[pos:pos+n], pageData[pageOffset:pageOffset+n])
 		pos += n
 	}
-	return nil
+	return int(pos), nil
 }
 
-// handleWrite handles an NBD write request. Sub-page writes trigger
-// a read-modify-write cycle.
-func (c *Conn) handleWrite(offset uint64, data []byte) error {
-	length := uint64(len(data))
+// WriteAt writes len(p) bytes to the snapshot starting at byte offset off.
+// Sub-page writes trigger a read-modify-write cycle.
+// It implements io.WriterAt.
+func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
+	length := uint64(len(p))
 	pageSize := uint64(c.server.pageSize)
 
 	c.server.writeBytes.Add(int64(length))
 
+	offset := uint64(off)
 	pos := uint64(0)
 	for pos < length {
 		absOffset := offset + pos
@@ -151,16 +166,16 @@ func (c *Conn) handleWrite(offset uint64, data []byte) error {
 		if pageOffset == 0 && n == pageSize {
 			// Full page write.
 			pageData = make([]byte, pageSize)
-			copy(pageData, data[pos:pos+n])
+			copy(pageData, p[pos:pos+n])
 		} else {
 			// Partial page write: read-modify-write.
 			existing, err := c.readPageData(pageNum)
 			if err != nil {
-				return err
+				return int(pos), err
 			}
 			pageData = make([]byte, pageSize)
 			copy(pageData, existing)
-			copy(pageData[pageOffset:], data[pos:pos+n])
+			copy(pageData[pageOffset:], p[pos:pos+n])
 		}
 
 		h := hashPage(pageData)
@@ -172,7 +187,7 @@ func (c *Conn) handleWrite(offset uint64, data []byte) error {
 		_, err := c.dirtyFile.WriteAt(pageData, int64(dirtyNum)*int64(pageSize))
 		if err != nil {
 			c.mu.Unlock()
-			return fmt.Errorf("writing dirty page: %w", err)
+			return int(pos), fmt.Errorf("writing dirty page: %w", err)
 		}
 
 		c.dirtyPages[pageNum] = &dirtyPageInfo{
@@ -185,12 +200,12 @@ func (c *Conn) handleWrite(offset uint64, data []byte) error {
 		c.server.writePages.Add(1)
 		pos += n
 	}
-	return nil
+	return int(pos), nil
 }
 
 // handleTrim forgets dirty pages in the given range, reverting
 // those pages to the base image.
-func (c *Conn) handleTrim(offset, length uint64) {
+func (c *Snapshot) handleTrim(offset, length uint64) {
 	pageSize := uint64(c.server.pageSize)
 	startPage := int64(offset / pageSize)
 	endPage := int64((offset + length + pageSize - 1) / pageSize)
