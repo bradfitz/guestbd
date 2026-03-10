@@ -260,7 +260,7 @@ func startTestServer(t *testing.T, fileData []byte, pageSize int) (addr string, 
 func startTestServerFile(t *testing.T, filePath string, pageSize int) (addr string, srv *Server, cleanup func()) {
 	t.Helper()
 
-	srv = NewServer(filePath, WithPageSize(pageSize), WithMaxMem(int64(pageSize)*256))
+	srv = NewServer(FileSource(filePath), WithPageSize(pageSize), WithMaxMem(int64(pageSize)*256))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -668,7 +668,7 @@ func TestInodeSharing(t *testing.T) {
 	addr, srv, cleanup := startTestServer(t, data, pageSize)
 	defer cleanup()
 
-	// Two connections to the same file should share the same readonlyFile.
+	// Two connections to the same file should share the same baseImageState.
 	c1 := newTestClient(t, addr)
 	defer c1.disconnect()
 	c2 := newTestClient(t, addr)
@@ -679,11 +679,11 @@ func TestInodeSharing(t *testing.T) {
 	c2.read(0, pageSize)
 
 	srv.mu.Lock()
-	numRO := len(srv.readonlyFiles)
+	hasRO := len(srv.roFiles) > 0
 	srv.mu.Unlock()
 
-	if numRO != 1 {
-		t.Fatalf("expected 1 readonlyFile, got %d", numRO)
+	if !hasRO {
+		t.Fatal("expected roFiles to be non-empty")
 	}
 }
 
@@ -696,19 +696,21 @@ func TestReconnectHitsCache(t *testing.T) {
 	addr, srv, cleanup := startTestServer(t, data, pageSize)
 	defer cleanup()
 
-	// First connection: read all pages, populating the cache.
+	// First connection: read all pages, populating the hash table and cache.
 	c1 := newTestClient(t, addr)
 	for i := 0; i < numPages; i++ {
 		c1.read(uint64(i*pageSize), pageSize)
 	}
 	c1.disconnect()
 
-	// Snapshot read path counters.
+	// Snapshot read path counters after first connection.
 	diskColdBefore := srv.readPath.Get("base_disk_cold").Value()
 	diskMissBefore := srv.readPath.Get("base_disk_miss").Value()
 	baseMemBefore := srv.readPath.Get("base_mem").Value()
 
-	// Second connection: same inode, all pages should come from cache.
+	// Second connection after full disconnect: FileSource provides identity
+	// so the idle baseImageState is matched and reused, preserving the page
+	// hash table. All reads should come from cache (0 cold reads).
 	c2 := newTestClient(t, addr)
 	defer c2.disconnect()
 	for i := 0; i < numPages; i++ {
@@ -728,13 +730,195 @@ func TestReconnectHitsCache(t *testing.T) {
 	newMem := baseMemAfter - baseMemBefore
 
 	if newCold != 0 {
-		t.Errorf("expected 0 base_disk_cold reads after reconnect, got %d", newCold)
+		t.Errorf("expected 0 base_disk_cold reads, got %d", newCold)
 	}
 	if newMiss != 0 {
-		t.Errorf("expected 0 base_disk_miss reads after reconnect, got %d", newMiss)
+		t.Errorf("expected 0 base_disk_miss reads, got %d", newMiss)
 	}
 	if newMem != int64(numPages) {
-		t.Errorf("expected %d base_mem reads after reconnect, got %d", numPages, newMem)
+		t.Errorf("expected %d base_mem reads, got %d", numPages, newMem)
+	}
+}
+
+func TestConcurrentSharesHashTable(t *testing.T) {
+	const pageSize = 4096
+	const numPages = 20
+	data := make([]byte, pageSize*numPages)
+	rand.Read(data)
+
+	addr, srv, cleanup := startTestServer(t, data, pageSize)
+	defer cleanup()
+
+	// First connection: read all pages, populating the hash table.
+	c1 := newTestClient(t, addr)
+	for i := 0; i < numPages; i++ {
+		c1.read(uint64(i*pageSize), pageSize)
+	}
+
+	// Snapshot read path counters while c1 is still connected.
+	diskColdBefore := srv.readPath.Get("base_disk_cold").Value()
+	diskMissBefore := srv.readPath.Get("base_disk_miss").Value()
+	baseMemBefore := srv.readPath.Get("base_mem").Value()
+
+	// Second connection while c1 is alive: shares the baseImageState
+	// and its page hash table, so all reads come from cache.
+	c2 := newTestClient(t, addr)
+	for i := 0; i < numPages; i++ {
+		got := c2.read(uint64(i*pageSize), pageSize)
+		want := data[i*pageSize : (i+1)*pageSize]
+		if !bytes.Equal(got, want) {
+			t.Fatalf("page %d mismatch", i)
+		}
+	}
+	c2.disconnect()
+	c1.disconnect()
+
+	diskColdAfter := srv.readPath.Get("base_disk_cold").Value()
+	diskMissAfter := srv.readPath.Get("base_disk_miss").Value()
+	baseMemAfter := srv.readPath.Get("base_mem").Value()
+
+	newCold := diskColdAfter - diskColdBefore
+	newMiss := diskMissAfter - diskMissBefore
+	newMem := baseMemAfter - baseMemBefore
+
+	if newCold != 0 {
+		t.Errorf("expected 0 base_disk_cold reads, got %d", newCold)
+	}
+	if newMiss != 0 {
+		t.Errorf("expected 0 base_disk_miss reads, got %d", newMiss)
+	}
+	if newMem != int64(numPages) {
+		t.Errorf("expected %d base_mem reads, got %d", numPages, newMem)
+	}
+}
+
+// noKeyBaseImage wraps a BaseImage and returns nil from BaseImageKey,
+// disabling equivalence-keyed caching.
+type noKeyBaseImage struct {
+	BaseImage
+}
+
+func (n *noKeyBaseImage) BaseImageKey() any { return nil }
+
+func TestReconnectNoIdentity(t *testing.T) {
+	const pageSize = 4096
+	const numPages = 20
+	data := make([]byte, pageSize*numPages)
+	rand.Read(data)
+
+	tmpFile, err := os.CreateTemp("", "guestbd-test-*")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	// Use a BaseImageSource that wraps FileSource's output with nil key.
+	inner := FileSource(tmpFile.Name())
+	noKeySource := func() (BaseImage, error) {
+		base, err := inner()
+		if err != nil {
+			return nil, err
+		}
+		return &noKeyBaseImage{base}, nil
+	}
+
+	srv := NewServer(noKeySource, WithPageSize(pageSize), WithMaxMem(int64(pageSize)*256))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go srv.HandleConn(conn)
+		}
+	}()
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	// First connection: read all pages.
+	c1 := newTestClient(t, addr)
+	for i := 0; i < numPages; i++ {
+		c1.read(uint64(i*pageSize), pageSize)
+	}
+	c1.disconnect()
+
+	// Snapshot counters.
+	diskColdBefore := srv.readPath.Get("base_disk_cold").Value()
+
+	// Second connection: nil key means the old idle roFile is replaced,
+	// so all reads should be cold.
+	c2 := newTestClient(t, addr)
+	defer c2.disconnect()
+	for i := 0; i < numPages; i++ {
+		got := c2.read(uint64(i*pageSize), pageSize)
+		want := data[i*pageSize : (i+1)*pageSize]
+		if !bytes.Equal(got, want) {
+			t.Fatalf("page %d mismatch on reconnect", i)
+		}
+	}
+
+	diskColdAfter := srv.readPath.Get("base_disk_cold").Value()
+	newCold := diskColdAfter - diskColdBefore
+	if newCold != int64(numPages) {
+		t.Errorf("expected %d base_disk_cold reads (no identity), got %d", numPages, newCold)
+	}
+}
+
+func TestBaseImageReplaced(t *testing.T) {
+	const pageSize = 4096
+	const numPages = 4
+	data1 := make([]byte, pageSize*numPages)
+	rand.Read(data1)
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "disk.raw")
+	if err := os.WriteFile(filePath, data1, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	addr, _, cleanup := startTestServerFile(t, filePath, pageSize)
+	defer cleanup()
+
+	// First connection: read all pages.
+	c1 := newTestClient(t, addr)
+	for i := 0; i < numPages; i++ {
+		got := c1.read(uint64(i*pageSize), pageSize)
+		if !bytes.Equal(got, data1[i*pageSize:(i+1)*pageSize]) {
+			t.Fatalf("page %d mismatch (first conn)", i)
+		}
+	}
+	c1.disconnect()
+
+	// Replace the file: write new content to a temp file and rename
+	// (new inode → different identity key).
+	data2 := make([]byte, pageSize*numPages)
+	rand.Read(data2)
+	tmpPath := filepath.Join(dir, "disk.raw.new")
+	if err := os.WriteFile(tmpPath, data2, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second connection: should see the new data.
+	c2 := newTestClient(t, addr)
+	defer c2.disconnect()
+	for i := 0; i < numPages; i++ {
+		got := c2.read(uint64(i*pageSize), pageSize)
+		if !bytes.Equal(got, data2[i*pageSize:(i+1)*pageSize]) {
+			t.Fatalf("page %d mismatch after file replacement: got %x... want %x...",
+				i, got[:8], data2[i*pageSize:i*pageSize+8])
+		}
 	}
 }
 
@@ -751,7 +935,7 @@ func BenchmarkRead(b *testing.B) {
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
 
-	srv := NewServer(tmpFile.Name(), WithPageSize(pageSize), WithMaxMem(int64(pageSize)*256))
+	srv := NewServer(FileSource(tmpFile.Name()), WithPageSize(pageSize), WithMaxMem(int64(pageSize)*256))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

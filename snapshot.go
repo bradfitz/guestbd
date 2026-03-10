@@ -21,7 +21,7 @@ var (
 // Snapshot implements io.ReaderAt and io.WriterAt.
 type Snapshot struct {
 	server *Server
-	roFile *readonlyFile
+	roFile *baseImageState
 
 	mu           sync.Mutex
 	dirtyPages   map[int64]*dirtyPageInfo // pageNum => dirty info
@@ -37,7 +37,7 @@ type dirtyPageInfo struct {
 
 // newSnapshot creates a new Snapshot for the given read-only backing file.
 // It creates an unlinked temporary file for dirty page storage.
-func newSnapshot(srv *Server, ro *readonlyFile) (*Snapshot, error) {
+func newSnapshot(srv *Server, ro *baseImageState) (*Snapshot, error) {
 	tmpFile, err := os.CreateTemp("", "guestbd-dirty-*")
 	if err != nil {
 		return nil, fmt.Errorf("creating temp file: %w", err)
@@ -67,7 +67,7 @@ func (c *Snapshot) Close() error {
 	c.server.snapshots.Delete(c)
 	c.server.mu.Unlock()
 
-	c.server.releaseReadonlyFile(c.roFile)
+	c.server.releaseBaseImageState(c.roFile)
 	return nil
 }
 

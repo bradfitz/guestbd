@@ -12,11 +12,104 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/bradfitz/qcow2"
 	"tailscale.com/metrics"
 	"tailscale.com/util/set"
 )
+
+// BaseImage is a read-only random-access image with a known size.
+// The server calls Close when the image is no longer needed.
+// Implementations that return a non-nil key from BaseImageKey enable
+// equivalence-keyed caching: idle baseImageStates whose key matches a
+// newly opened image are reused, preserving the page hash table.
+type BaseImage interface {
+	io.ReaderAt
+	io.Closer
+	Size() int64
+	BaseImageKey() any // nil = no coalescing; non-nil must be comparable
+}
+
+// BaseImageSource is a function that opens and returns the base image.
+// It is called lazily when the first snapshot is created.
+type BaseImageSource func() (BaseImage, error)
+
+// NewBaseImage returns a BaseImage wrapping an io.ReaderAt with a fixed size.
+// The returned BaseImage has no identity key (BaseImageKey returns nil),
+// so idle baseImageStates using it will not be reused across connections.
+func NewBaseImage(r io.ReaderAt, size int64) BaseImage {
+	return &plainBaseImage{r: r, size: size}
+}
+
+type plainBaseImage struct {
+	r    io.ReaderAt
+	size int64
+}
+
+func (p *plainBaseImage) ReadAt(b []byte, off int64) (int, error) { return p.r.ReadAt(b, off) }
+func (p *plainBaseImage) Size() int64                             { return p.size }
+func (p *plainBaseImage) Close() error                            { return nil }
+func (p *plainBaseImage) BaseImageKey() any                       { return nil }
+
+// fileIdentityKey uniquely identifies an on-disk file by device and inode.
+type fileIdentityKey struct {
+	dev uint64
+	ino uint64
+}
+
+// fileSizeReaderAt wraps an *os.File as a BaseImage.
+type fileSizeReaderAt struct {
+	f    *os.File
+	size int64
+	key  fileIdentityKey
+}
+
+func (r *fileSizeReaderAt) ReadAt(p []byte, off int64) (int, error) { return r.f.ReadAt(p, off) }
+func (r *fileSizeReaderAt) Size() int64                             { return r.size }
+func (r *fileSizeReaderAt) Close() error                            { return r.f.Close() }
+func (r *fileSizeReaderAt) BaseImageKey() any                       { return r.key }
+
+// qcow2SizeReaderAt wraps a *qcow2.Image as a BaseImage, holding the
+// underlying *os.File so it can be closed.
+type qcow2SizeReaderAt struct {
+	img *qcow2.Image
+	f   *os.File
+	key fileIdentityKey
+}
+
+func (r *qcow2SizeReaderAt) ReadAt(p []byte, off int64) (int, error) { return r.img.ReadAt(p, off) }
+func (r *qcow2SizeReaderAt) Size() int64                             { return r.img.Size() }
+func (r *qcow2SizeReaderAt) Close() error                            { return r.f.Close() }
+func (r *qcow2SizeReaderAt) BaseImageKey() any                       { return r.key }
+
+// FileSource returns a BaseImageSource that opens the file at path.
+// Files ending in ".qcow2" are opened as qcow2 images; all others are
+// treated as raw disk images.
+func FileSource(path string) BaseImageSource {
+	return func() (BaseImage, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		st := fi.Sys().(*syscall.Stat_t)
+		key := fileIdentityKey{dev: st.Dev, ino: st.Ino}
+		if strings.HasSuffix(path, ".qcow2") {
+			img, err := qcow2.Open(f)
+			if err != nil {
+				f.Close()
+				return nil, fmt.Errorf("opening qcow2 image: %w", err)
+			}
+			return &qcow2SizeReaderAt{img, f, key}, nil
+		}
+		return &fileSizeReaderAt{f, fi.Size(), key}, nil
+	}
+}
 
 // ServerOption configures optional Server parameters.
 type ServerOption func(*serverConfig)
@@ -25,6 +118,7 @@ type serverConfig struct {
 	pageSize       int
 	maxMem         int64
 	sharedSnapshot bool
+	maxIdleBase    int
 }
 
 // WithPageSize sets the page size in bytes. It must be a positive power of two.
@@ -46,23 +140,35 @@ func WithSharedSnapshot() ServerOption {
 	return func(c *serverConfig) { c.sharedSnapshot = true }
 }
 
-// Server is an NBD server that serves a single backing file to multiple
+// WithMaxIdleBase sets the maximum number of idle base images to keep cached
+// for equivalence-keyed reuse. When a baseImageState becomes idle (refcount 0)
+// and its BaseImageKey is non-nil, it is kept in a cache of up to n entries.
+// The default is 1.
+func WithMaxIdleBase(n int) ServerOption {
+	return func(c *serverConfig) { c.maxIdleBase = n }
+}
+
+// Server is an NBD server that serves a single backing image to multiple
 // concurrent clients. Each client connection may get an independent
 // copy-on-write Snapshot, or multiple connections may share a single Snapshot
 // to allow reconnection to a previous writable state. The snapshot policy is
 // configured via WithSharedSnapshot at construction time.
 type Server struct {
-	mu           sync.Mutex
-	filePath     string
-	pageSize     int
+	mu       sync.Mutex
+	getBase  BaseImageSource
+	pageSize int
+
 	zeroPageHash pageHash // sha256 of a page filled entirely with zero bytes
 	cache        *pageCache
 
 	useSharedSnapshot bool      // set by WithSharedSnapshot
 	sharedSnap        *Snapshot // lazily created when useSharedSnapshot is true
 
-	readonlyFiles map[inodeKey]*readonlyFile
-	snapshots     set.Set[*Snapshot]
+	roFiles     map[any]*baseImageState // identity-keyed entries (active + idle)
+	roFileNoKey *baseImageState         // single entry for nil-key sources
+	maxIdleBase int                     // max idle entries in roFiles
+	nextIdleSeq int64                   // monotonic counter for idle LRU ordering
+	snapshots   set.Set[*Snapshot]
 
 	totalConns       expvar.Int         // counter_guestbd_total_conns
 	activeConns      expvar.Int         // gauge_guestbd_active_conns
@@ -78,10 +184,8 @@ type Server struct {
 	baseImagesCached expvar.Int         // gauge_guestbd_base_images_cached
 }
 
-// NewServer creates a new Server that serves the file at filePath.
-// Files ending in ".qcow2" are opened as qcow2 images; all others are
-// treated as raw disk images.
-func NewServer(filePath string, opts ...ServerOption) *Server {
+// NewServer creates a new Server that serves the base image returned by getBase.
+func NewServer(getBase BaseImageSource, opts ...ServerOption) *Server {
 	cfg := serverConfig{
 		pageSize: 4096,
 		maxMem:   1 << 30, // 1GB default
@@ -102,13 +206,19 @@ func NewServer(filePath string, opts ...ServerOption) *Server {
 		sizeBuckets = append(sizeBuckets, v)
 	}
 
+	maxIdleBase := cfg.maxIdleBase
+	if maxIdleBase == 0 {
+		maxIdleBase = 1
+	}
+
 	srv := &Server{
-		filePath:          filePath,
+		getBase:           getBase,
 		pageSize:          pageSize,
 		useSharedSnapshot: cfg.sharedSnapshot,
 		zeroPageHash:      hashPage(make([]byte, pageSize)),
 		cache:             newPageCache(maxPages, pageSize),
-		readonlyFiles:     make(map[inodeKey]*readonlyFile),
+		roFiles:           make(map[any]*baseImageState),
+		maxIdleBase:       maxIdleBase,
 		snapshots:         make(set.Set[*Snapshot]),
 		ops:               metrics.LabelMap{Label: "type"},
 		readPath:          metrics.LabelMap{Label: "type"},
@@ -161,66 +271,77 @@ func (s *Server) InitExpvar() {
 	}))
 }
 
-// getReadonlyFile returns the readonlyFile for the backing file,
-// sharing it across connections with the same inode. The readonlyFile
-// and its pageHashes table persist even when refcount drops to zero,
-// so that subsequent connections to the same inode benefit from the
-// already-computed hash table (which is the index into the LRU cache).
-func (s *Server) getReadonlyFile() (*readonlyFile, error) {
-	f, err := os.Open(s.filePath)
+// getBaseImageState returns a baseImageState for the backing image.
+// getBase is called on every invocation. If there is already an active or
+// idle baseImageState with a matching BaseImageKey, the newly opened base is
+// closed and the existing baseImageState is reused (preserving its page hash
+// table). Sources returning nil keys share while active but are replaced
+// when idle.
+func (s *Server) getBaseImageState() (*baseImageState, error) {
+	base, err := s.getBase()
 	if err != nil {
 		return nil, err
 	}
-	fi, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	key := fileInodeKey(fi)
+
+	key := base.BaseImageKey()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if ro, ok := s.readonlyFiles[key]; ok {
-		ro.mu.Lock()
-		wasIdle := ro.refcount == 0
-		ro.refcount++
-		ro.mu.Unlock()
-		if wasIdle {
-			s.baseImagesActive.Add(1)
+	if key != nil {
+		if ro, ok := s.roFiles[key]; ok {
+			// Found a matching entry (active or idle). Close the new base
+			// and bump refcount.
+			base.Close()
+			ro.mu.Lock()
+			wasIdle := ro.refcount == 0
+			ro.refcount++
+			ro.mu.Unlock()
+			if wasIdle {
+				s.baseImagesActive.Add(1)
+				ro.idleSince = 0
+			}
+			return ro, nil
 		}
-		f.Close()
+		// Not found — create new and insert.
+		ro := newBaseImageState(s, base, key)
+		s.roFiles[key] = ro
+		s.baseImagesActive.Add(1)
+		s.baseImagesCached.Add(1)
+		s.evictIdleLocked()
 		return ro, nil
 	}
 
-	var reader io.ReaderAt
-	size := fi.Size()
-	if strings.HasSuffix(s.filePath, ".qcow2") {
-		img, err := qcow2.Open(f)
-		if err != nil {
-			f.Close()
-			return nil, fmt.Errorf("opening qcow2 image: %w", err)
+	// key == nil
+	if ro := s.roFileNoKey; ro != nil {
+		ro.mu.Lock()
+		rc := ro.refcount
+		ro.mu.Unlock()
+		if rc > 0 {
+			// Active — share.
+			base.Close()
+			ro.mu.Lock()
+			ro.refcount++
+			ro.mu.Unlock()
+			return ro, nil
 		}
-		reader = img
-		size = img.Size()
-	} else {
-		reader = f
+		// Idle — close old base and replace.
+		ro.base.Close()
+		s.baseImagesCached.Add(-1)
 	}
 
-	ro := newReadonlyFile(s, f, size, reader)
-	s.readonlyFiles[key] = ro
-	s.baseImagesActive.Add(1) // new entry starts with refcount 1
+	ro := newBaseImageState(s, base, nil)
+	s.roFileNoKey = ro
+	s.baseImagesActive.Add(1)
 	s.baseImagesCached.Add(1)
 	return ro, nil
 }
 
-// releaseReadonlyFile decrements the refcount. If the refcount reaches
-// zero, it checks whether the file on disk still points to the same
-// inode. If the file is gone or has a different inode, the readonlyFile
-// is removed and its fd closed — no future client can use it. Otherwise
-// it stays in the map so the pageHashes index remains available for the
-// next connection.
-func (s *Server) releaseReadonlyFile(ro *readonlyFile) {
+// releaseBaseImageState decrements the refcount. When it reaches zero the
+// baseImagesActive metric is updated. For keyed entries, the baseImageState
+// stays in the roFiles map as an idle entry (subject to LRU eviction).
+// For nil-key entries, it stays in roFileNoKey and is replaced next call.
+func (s *Server) releaseBaseImageState(ro *baseImageState) {
 	ro.mu.Lock()
 	ro.refcount--
 	rc := ro.refcount
@@ -232,20 +353,45 @@ func (s *Server) releaseReadonlyFile(ro *readonlyFile) {
 
 	s.baseImagesActive.Add(-1)
 
-	// Check whether the file on disk still matches this inode.
-	fi, err := os.Stat(s.filePath)
-	if err != nil || fileInodeKey(fi) != fileInodeKey(ro.fileInfo()) {
-		// File is gone or replaced; no future client will ever
-		// open this inode. Clean it up.
-		s.mu.Lock()
-		for k, v := range s.readonlyFiles {
-			if v == ro {
-				delete(s.readonlyFiles, k)
-				break
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if ro.identityKey != nil {
+		s.nextIdleSeq++
+		ro.idleSince = s.nextIdleSeq
+		s.evictIdleLocked()
+	}
+}
+
+// evictIdleLocked removes the oldest idle entries from s.roFiles until
+// the number of idle entries is at most s.maxIdleBase.
+func (s *Server) evictIdleLocked() {
+	for {
+		var (
+			idleCount   int
+			oldestKey   any
+			oldestSeq   int64
+			oldestEntry *baseImageState
+		)
+		for k, ro := range s.roFiles {
+			ro.mu.Lock()
+			rc := ro.refcount
+			ro.mu.Unlock()
+			if rc == 0 {
+				idleCount++
+				if oldestEntry == nil || ro.idleSince < oldestSeq {
+					oldestKey = k
+					oldestSeq = ro.idleSince
+					oldestEntry = ro
+				}
 			}
 		}
-		s.mu.Unlock()
-		ro.f.Close()
+		if idleCount <= s.maxIdleBase {
+			return
+		}
+		// Evict oldest idle.
+		oldestEntry.base.Close()
+		delete(s.roFiles, oldestKey)
 		s.baseImagesCached.Add(-1)
 	}
 }
@@ -254,13 +400,13 @@ func (s *Server) releaseReadonlyFile(ro *readonlyFile) {
 // image. The caller is responsible for calling Close when the snapshot is no
 // longer needed.
 func (s *Server) NewSnapshot() (*Snapshot, error) {
-	ro, err := s.getReadonlyFile()
+	ro, err := s.getBaseImageState()
 	if err != nil {
 		return nil, fmt.Errorf("opening base image: %w", err)
 	}
 	snap, err := newSnapshot(s, ro)
 	if err != nil {
-		s.releaseReadonlyFile(ro)
+		s.releaseBaseImageState(ro)
 		return nil, err
 	}
 	s.mu.Lock()
@@ -270,14 +416,24 @@ func (s *Server) NewSnapshot() (*Snapshot, error) {
 }
 
 // Close cleans up server resources, including any shared Snapshot created
-// via WithSharedSnapshot.
+// via WithSharedSnapshot and all cached baseImageStates.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	snap := s.sharedSnap
 	s.sharedSnap = nil
+	roFiles := s.roFiles
+	s.roFiles = nil
+	roNoKey := s.roFileNoKey
+	s.roFileNoKey = nil
 	s.mu.Unlock()
 	if snap != nil {
 		snap.Close()
+	}
+	for _, ro := range roFiles {
+		ro.base.Close()
+	}
+	if roNoKey != nil {
+		roNoKey.base.Close()
 	}
 	return nil
 }

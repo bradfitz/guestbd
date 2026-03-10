@@ -46,7 +46,7 @@ func main() {
 		opts = append(opts, guestbd.WithSharedSnapshot())
 	}
 
-	srv := guestbd.NewServer(*flagFile, opts...)
+	srv := guestbd.NewServer(guestbd.FileSource(*flagFile), opts...)
 	defer srv.Close()
 	srv.InitExpvar()
 

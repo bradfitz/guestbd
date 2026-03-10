@@ -2,59 +2,45 @@ package guestbd
 
 import (
 	"io"
-	"os"
 	"sync"
-	"syscall"
 )
 
-// inodeKey uniquely identifies a file by device and inode number.
-type inodeKey struct {
-	dev uint64
-	ino uint64
-}
+// baseImageState represents a shared read-only backing image.
+// Multiple connections share one baseImageState.
+//
+// Locking: fields are protected by either mu or Server.mu as noted.
+// base and size are immutable after construction and need no lock.
+// When both locks are needed, Server.mu must be acquired first;
+// mu is never held when acquiring Server.mu.
+type baseImageState struct {
+	srv         *Server   // immutable
+	base        BaseImage // immutable; used for page reads
+	size        int64     // immutable; cached from base.Size()
+	identityKey any       // immutable; non-nil if base returned a key; used as roFiles map key
 
-// fileInodeKey returns the inodeKey for the given FileInfo by extracting the
-// device and inode numbers from its underlying syscall.Stat_t.
-func fileInodeKey(fi os.FileInfo) inodeKey {
-	stat := fi.Sys().(*syscall.Stat_t)
-	return inodeKey{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}
-}
+	idleSince int64 // protected by Server.mu; monotonic seq for LRU eviction; 0 while active
 
-// readonlyFile represents a shared read-only backing file, keyed by inode.
-// Multiple connections to the same file share one readonlyFile.
-type readonlyFile struct {
-	srv      *Server
 	mu       sync.Mutex
-	f        *os.File    // underlying file (for Stat, Close)
-	reader   io.ReaderAt // used for page reads (may be *os.File or *qcow2.Image)
-	size     int64       // virtual size (file size for raw, virtual disk size for qcow2)
-	refcount int32
-
+	refcount int32 // protected by mu
 	// pageHashes is lazily computed per page.
 	// A zero value means the page has not been read from disk yet.
 	// A value equal to Server.zeroPageHash means the page is all zeros.
-	pageHashes []pageHash
+	pageHashes []pageHash // protected by mu
 }
 
-// newReadonlyFile creates a new readonlyFile with a pre-allocated pageHashes
+// newBaseImageState creates a new baseImageState with a pre-allocated pageHashes
 // table sized for the given virtual disk size. The refcount starts at 1.
-func newReadonlyFile(srv *Server, f *os.File, size int64, reader io.ReaderAt) *readonlyFile {
-	pageSize := srv.pageSize
-	numPages := (size + int64(pageSize) - 1) / int64(pageSize)
-	return &readonlyFile{
-		srv:        srv,
-		f:          f,
-		reader:     reader,
-		size:       size,
-		refcount:   1,
-		pageHashes: make([]pageHash, numPages),
+func newBaseImageState(srv *Server, base BaseImage, key any) *baseImageState {
+	size := base.Size()
+	numPages := (size + int64(srv.pageSize) - 1) / int64(srv.pageSize)
+	return &baseImageState{
+		srv:         srv,
+		base:        base,
+		size:        size,
+		identityKey: key,
+		refcount:    1,
+		pageHashes:  make([]pageHash, numPages),
 	}
-}
-
-// fileInfo returns the FileInfo for the underlying file.
-func (r *readonlyFile) fileInfo() os.FileInfo {
-	fi, _ := r.f.Stat()
-	return fi
 }
 
 // readResult describes where a page read was served from.
@@ -68,7 +54,7 @@ const (
 
 // readPage reads page n from the backing file and returns its data, hash,
 // and how the read was served (cache hit, cold disk read, or cache miss disk read).
-func (r *readonlyFile) readPage(n int64) (data []byte, hash pageHash, result readResult, err error) {
+func (r *baseImageState) readPage(n int64) (data []byte, hash pageHash, result readResult, err error) {
 	r.mu.Lock()
 	h := r.pageHashes[n]
 	r.mu.Unlock()
@@ -88,7 +74,7 @@ func (r *readonlyFile) readPage(n int64) (data []byte, hash pageHash, result rea
 	// Need to read from disk.
 	buf := make([]byte, pageSize)
 	offset := n * int64(pageSize)
-	nr, readErr := r.reader.ReadAt(buf, offset)
+	nr, readErr := r.base.ReadAt(buf, offset)
 	if readErr != nil && readErr != io.EOF {
 		return nil, pageHash{}, 0, readErr
 	}

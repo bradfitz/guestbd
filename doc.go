@@ -5,12 +5,14 @@
 // read-only base image. By default each TCP connection gets its own Snapshot
 // whose writes are discarded on disconnect, but a Snapshot can also be shared
 // across multiple connections so that reconnecting clients see previous writes.
-// The base image may be a raw disk file or a qcow2 image (auto-detected by
-// file extension).
+//
+// The base image is provided as a [BaseImageSource] — a function returning a
+// [BaseImage] — so callers can serve images from files, object stores,
+// or memory. [BaseImage.BaseImageKey] enables equivalence-keyed caching of
+// idle baseImageStates so that reconnecting clients reuse the page hash table.
+// The [FileSource] helper provides the common file-based workflow, with
+// automatic qcow2 detection by file extension.
 //
 // Pages are content-addressed by their SHA-256 hash and de-duplicated in a
-// global LRU cache shared across all snapshots. Multiple snapshots backed by
-// the same file (same inode) share the same page hash table, so
-// reconnecting clients benefit from previously computed hashes without
-// re-reading from disk.
+// global LRU cache shared across all snapshots.
 package guestbd
