@@ -82,9 +82,12 @@ func (c *Snapshot) readPageData(pageNum int64) ([]byte, error) {
 
 	if dirty {
 		c.server.readPath.Add("from_write", 1)
-		// Try the global cache first.
-		if data, ok := c.server.cache.Get(dp.hash); ok {
-			return data, nil
+		cache := c.server.cache
+		if cache != nil {
+			// Try the global cache first.
+			if data, ok := cache.Get(dp.hash); ok {
+				return data, nil
+			}
 		}
 		// Read from the snapshot's dirty file.
 		buf := make([]byte, c.server.pageSize)
@@ -92,7 +95,9 @@ func (c *Snapshot) readPageData(pageNum int64) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading dirty page: %w", err)
 		}
-		c.server.cache.Put(dp.hash, buf)
+		if cache != nil {
+			cache.Put(dp.hash, buf)
+		}
 		return buf, nil
 	}
 
@@ -178,7 +183,11 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 			copy(pageData[pageOffset:], p[pos:pos+n])
 		}
 
-		h := hashPage(pageData)
+		cache := c.server.cache
+		var h pageHash
+		if cache != nil {
+			h = hashPage(pageData)
+		}
 
 		c.mu.Lock()
 		dirtyNum := c.nextDirtyNum
@@ -196,7 +205,9 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 		}
 		c.mu.Unlock()
 
-		c.server.cache.Put(h, pageData)
+		if cache != nil {
+			cache.Put(h, pageData)
+		}
 		c.server.writePages.Add(1)
 		pos += n
 	}

@@ -128,7 +128,8 @@ func WithPageSize(n int) ServerOption {
 }
 
 // WithMaxMem sets the maximum memory used by the shared page cache.
-// The default is 1GB.
+// The default is 1GB. A value of 0 disables page hashing and caching
+// entirely; reads of non-dirty pages go directly to the base image.
 func WithMaxMem(n int64) ServerOption {
 	return func(c *serverConfig) { c.maxMem = n }
 }
@@ -154,22 +155,22 @@ func WithMaxIdleBase(n int) ServerOption {
 // to allow reconnection to a previous writable state. The snapshot policy is
 // configured via WithSharedSnapshot at construction time.
 type Server struct {
-	mu       sync.Mutex
-	getBase  BaseImageSource
-	pageSize int
+	// Immutable after construction:
+	getBase           BaseImageSource // immutable
+	pageSize          int             // immutable
+	zeroPageHash      pageHash        // immutable; sha256 of an all-zero page
+	cache             *pageCache      // immutable; nil when WithMaxMem(0) disables caching
+	useSharedSnapshot bool            // immutable; set by WithSharedSnapshot
+	maxIdleBase       int             // immutable; max idle entries in roFiles
 
-	zeroPageHash pageHash // sha256 of a page filled entirely with zero bytes
-	cache        *pageCache
-
-	useSharedSnapshot bool      // set by WithSharedSnapshot
-	sharedSnap        *Snapshot // lazily created when useSharedSnapshot is true
-
-	roFiles     map[any]*baseImageState // identity-keyed entries (active + idle)
-	roFileNoKey *baseImageState         // single entry for nil-key sources
-	maxIdleBase int                     // max idle entries in roFiles
-	nextIdleSeq int64                   // monotonic counter for idle LRU ordering
+	mu          sync.Mutex
+	sharedSnap  *Snapshot                // lazily created when useSharedSnapshot is true
+	roFiles     map[any]*baseImageState  // identity-keyed entries (active + idle)
+	roFileNoKey *baseImageState          // single entry for nil-key sources
+	nextIdleSeq int64                    // monotonic counter for idle LRU ordering
 	snapshots   set.Set[*Snapshot]
 
+	// Metrics (atomic, no mutex needed):
 	totalConns       expvar.Int         // counter_guestbd_total_conns
 	activeConns      expvar.Int         // gauge_guestbd_active_conns
 	ops              metrics.LabelMap   // counter_guestbd_nbd_ops{type=...}
@@ -195,9 +196,14 @@ func NewServer(getBase BaseImageSource, opts ...ServerOption) *Server {
 	}
 
 	pageSize := cfg.pageSize
-	maxPages := int(cfg.maxMem) / pageSize
-	if maxPages < 1 {
-		maxPages = 1
+
+	var cache *pageCache
+	if cfg.maxMem > 0 {
+		maxPages := int(cfg.maxMem) / pageSize
+		if maxPages < 1 {
+			maxPages = 1
+		}
+		cache = newPageCache(maxPages, pageSize)
 	}
 
 	// Powers of two from 1 to 4MB.
@@ -215,8 +221,7 @@ func NewServer(getBase BaseImageSource, opts ...ServerOption) *Server {
 		getBase:           getBase,
 		pageSize:          pageSize,
 		useSharedSnapshot: cfg.sharedSnapshot,
-		zeroPageHash:      hashPage(make([]byte, pageSize)),
-		cache:             newPageCache(maxPages, pageSize),
+		cache:             cache,
 		roFiles:           make(map[any]*baseImageState),
 		maxIdleBase:       maxIdleBase,
 		snapshots:         make(set.Set[*Snapshot]),
@@ -224,6 +229,9 @@ func NewServer(getBase BaseImageSource, opts ...ServerOption) *Server {
 		readPath:          metrics.LabelMap{Label: "type"},
 		readSizeHist:      metrics.NewHistogram(sizeBuckets),
 		writeSizeHist:     metrics.NewHistogram(sizeBuckets),
+	}
+	if cache != nil {
+		srv.zeroPageHash = hashPage(make([]byte, pageSize))
 	}
 
 	return srv
@@ -243,9 +251,11 @@ func (s *Server) InitExpvar() {
 	expvar.Publish("counter_guestbd_write_pages", &s.writePages)
 	expvar.Publish("histogram_guestbd_read_size_bytes", s.readSizeHist)
 	expvar.Publish("histogram_guestbd_write_size_bytes", s.writeSizeHist)
-	expvar.Publish("counter_guestbd_cache", &s.cache.path)
-	expvar.Publish("gauge_guestbd_cache_entries", &s.cache.entries)
-	expvar.Publish("gauge_guestbd_cache_bytes", &s.cache.bytes)
+	if s.cache != nil {
+		expvar.Publish("counter_guestbd_cache", &s.cache.path)
+		expvar.Publish("gauge_guestbd_cache_entries", &s.cache.entries)
+		expvar.Publish("gauge_guestbd_cache_bytes", &s.cache.bytes)
+	}
 
 	expvar.Publish("gauge_guestbd_base_images_active", &s.baseImagesActive)
 	expvar.Publish("gauge_guestbd_base_images_cached", &s.baseImagesCached)

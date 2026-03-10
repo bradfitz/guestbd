@@ -1045,6 +1045,89 @@ func TestPageCacheLRU(t *testing.T) {
 	}
 }
 
+func TestNoCacheMode(t *testing.T) {
+	const pageSize = 4096
+	data := make([]byte, pageSize*4)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+
+	tmpFile, err := os.CreateTemp("", "guestbd-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	srv := NewServer(FileSource(tmpFile.Name()), WithPageSize(pageSize), WithMaxMem(0))
+	if srv.cache != nil {
+		t.Fatal("expected nil cache with WithMaxMem(0)")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go srv.HandleConn(conn)
+		}
+	}()
+	addr := ln.Addr().String()
+
+	c := newTestClient(t, addr)
+	defer c.disconnect()
+
+	// Read base image data.
+	got := c.read(0, pageSize)
+	if !bytes.Equal(got, data[:pageSize]) {
+		t.Fatal("first page mismatch")
+	}
+
+	// Full page write and read back.
+	writeData := make([]byte, pageSize)
+	for i := range writeData {
+		writeData[i] = 0xAB
+	}
+	c.write(0, writeData)
+	got = c.read(0, pageSize)
+	if !bytes.Equal(got, writeData) {
+		t.Fatal("written page mismatch")
+	}
+
+	// Sub-page write (read-modify-write without cache).
+	patch := bytes.Repeat([]byte{0xFF}, 100)
+	c.write(pageSize+200, patch)
+	got = c.read(pageSize, pageSize)
+	expected := make([]byte, pageSize)
+	copy(expected, data[pageSize:2*pageSize])
+	copy(expected[200:], patch)
+	if !bytes.Equal(got, expected) {
+		t.Fatal("sub-page write mismatch")
+	}
+
+	// Trim reverts to base image.
+	c.trim(0, pageSize)
+	got = c.read(0, pageSize)
+	if !bytes.Equal(got, data[:pageSize]) {
+		t.Fatal("trim should revert to original")
+	}
+
+	// Unwritten page still reads from base.
+	got = c.read(uint64(pageSize*3), pageSize)
+	if !bytes.Equal(got, data[pageSize*3:]) {
+		t.Fatal("unwritten page mismatch")
+	}
+}
+
 func TestMultiplePageSizes(t *testing.T) {
 	for _, pageSize := range []int{512, 1024, 4096, 8192} {
 		t.Run(fmt.Sprintf("pageSize=%d", pageSize), func(t *testing.T) {

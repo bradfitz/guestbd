@@ -31,14 +31,17 @@ type baseImageState struct {
 // newBaseImageState creates a new baseImageState for the given base image.
 // The refcount starts at 1.
 func newBaseImageState(srv *Server, base BaseImage, key any) *baseImageState {
-	return &baseImageState{
+	bs := &baseImageState{
 		srv:         srv,
 		base:        base,
 		size:        base.Size(),
 		identityKey: key,
 		refcount:    1,
-		pageHashes:  make(map[int64]pageHash),
 	}
+	if srv.cache != nil {
+		bs.pageHashes = make(map[int64]pageHash)
+	}
+	return bs
 }
 
 // readResult describes where a page read was served from.
@@ -52,13 +55,31 @@ const (
 
 // readPage reads page n from the backing file and returns its data, hash,
 // and how the read was served (cache hit, cold disk read, or cache miss disk read).
-func (r *baseImageState) readPage(n int64) (data []byte, hash pageHash, result readResult, err error) {
-	r.mu.Lock()
-	h, hashKnown := r.pageHashes[n]
-	r.mu.Unlock()
+//
+// When the server has no page cache (WithMaxMem(0)), readPage skips hashing
+// and cache operations and reads directly from the base image.
+func (bs *baseImageState) readPage(n int64) (data []byte, hash pageHash, result readResult, err error) {
+	cache := bs.srv.cache
+	pageSize := bs.srv.pageSize
 
-	cache := r.srv.cache
-	pageSize := r.srv.pageSize
+	if cache == nil {
+		// No caching; read straight from the base image.
+		buf := make([]byte, pageSize)
+		offset := n * int64(pageSize)
+		nr, readErr := bs.base.ReadAt(buf, offset)
+		if readErr != nil && readErr != io.EOF {
+			return nil, pageHash{}, 0, readErr
+		}
+		for i := nr; i < pageSize; i++ {
+			buf[i] = 0
+		}
+		return buf, pageHash{}, readFromDiskCold, nil
+	}
+
+	bs.mu.Lock()
+	h, hashKnown := bs.pageHashes[n]
+	bs.mu.Unlock()
+
 	if hashKnown {
 		// Already have the hash; try cache.
 		if d, ok := cache.Get(h); ok {
@@ -69,7 +90,7 @@ func (r *baseImageState) readPage(n int64) (data []byte, hash pageHash, result r
 	// Need to read from disk.
 	buf := make([]byte, pageSize)
 	offset := n * int64(pageSize)
-	nr, readErr := r.base.ReadAt(buf, offset)
+	nr, readErr := bs.base.ReadAt(buf, offset)
 	if readErr != nil && readErr != io.EOF {
 		return nil, pageHash{}, 0, readErr
 	}
@@ -80,11 +101,11 @@ func (r *baseImageState) readPage(n int64) (data []byte, hash pageHash, result r
 
 	h = hashPage(buf)
 
-	r.mu.Lock()
-	if _, ok := r.pageHashes[n]; !ok {
-		r.pageHashes[n] = h
+	bs.mu.Lock()
+	if _, ok := bs.pageHashes[n]; !ok {
+		bs.pageHashes[n] = h
 	}
-	r.mu.Unlock()
+	bs.mu.Unlock()
 
 	cache.Put(h, buf)
 	if hashKnown {
