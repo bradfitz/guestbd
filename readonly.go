@@ -53,27 +53,28 @@ const (
 	readFromDiskMiss                   // hash known but evicted from LRU cache, re-read from disk
 )
 
-// readPage reads page n from the backing file and returns its data, hash,
+// readPage reads page n from the backing file into buf and returns its hash
 // and how the read was served (cache hit, cold disk read, or cache miss disk read).
+// buf must be at least pageSize bytes long or readPage panics.
 //
 // When the server has no page cache (WithMaxMem(0)), readPage skips hashing
 // and cache operations and reads directly from the base image.
-func (bs *baseImageState) readPage(n int64) (data []byte, hash pageHash, result readResult, err error) {
+func (bs *baseImageState) readPage(buf []byte, n int64) (hash pageHash, result readResult, err error) {
 	cache := bs.srv.cache
 	pageSize := bs.srv.pageSize
+	_ = buf[pageSize-1] // bounds check hint; panics if too small
 
 	if cache == nil {
 		// No caching; read straight from the base image.
-		buf := make([]byte, pageSize)
 		offset := n * int64(pageSize)
-		nr, readErr := bs.base.ReadAt(buf, offset)
+		nr, readErr := bs.base.ReadAt(buf[:pageSize], offset)
 		if readErr != nil && readErr != io.EOF {
-			return nil, pageHash{}, 0, readErr
+			return pageHash{}, 0, readErr
 		}
 		for i := nr; i < pageSize; i++ {
 			buf[i] = 0
 		}
-		return buf, pageHash{}, readFromDiskCold, nil
+		return pageHash{}, readFromDiskCold, nil
 	}
 
 	bs.mu.Lock()
@@ -83,23 +84,23 @@ func (bs *baseImageState) readPage(n int64) (data []byte, hash pageHash, result 
 	if hashKnown {
 		// Already have the hash; try cache.
 		if d, ok := cache.Get(h); ok {
-			return d, h, readFromCache, nil
+			copy(buf, d)
+			return h, readFromCache, nil
 		}
 	}
 
 	// Need to read from disk.
-	buf := make([]byte, pageSize)
 	offset := n * int64(pageSize)
-	nr, readErr := bs.base.ReadAt(buf, offset)
+	nr, readErr := bs.base.ReadAt(buf[:pageSize], offset)
 	if readErr != nil && readErr != io.EOF {
-		return nil, pageHash{}, 0, readErr
+		return pageHash{}, 0, readErr
 	}
 	// Zero-fill remainder (last page may be short).
 	for i := nr; i < pageSize; i++ {
 		buf[i] = 0
 	}
 
-	h = hashPage(buf)
+	h = hashPage(buf[:pageSize])
 
 	bs.mu.Lock()
 	if _, ok := bs.pageHashes[n]; !ok {
@@ -107,9 +108,9 @@ func (bs *baseImageState) readPage(n int64) (data []byte, hash pageHash, result 
 	}
 	bs.mu.Unlock()
 
-	cache.Put(h, buf)
+	cache.Put(h, buf[:pageSize])
 	if hashKnown {
-		return buf, h, readFromDiskMiss, nil
+		return h, readFromDiskMiss, nil
 	}
-	return buf, h, readFromDiskCold, nil
+	return h, readFromDiskCold, nil
 }

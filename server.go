@@ -162,6 +162,7 @@ type Server struct {
 	cache             *pageCache      // immutable; nil when WithMaxMem(0) disables caching
 	useSharedSnapshot bool            // immutable; set by WithSharedSnapshot
 	maxIdleBase       int             // immutable; max idle entries in roFiles
+	pageBufPool       sync.Pool       // immutable; pool of *[]byte, each pageSize long
 
 	mu          sync.Mutex
 	sharedSnap  *Snapshot                // lazily created when useSharedSnapshot is true
@@ -222,6 +223,7 @@ func NewServer(getBase BaseImageSource, opts ...ServerOption) *Server {
 		pageSize:          pageSize,
 		useSharedSnapshot: cfg.sharedSnapshot,
 		cache:             cache,
+		pageBufPool:       sync.Pool{New: func() any { b := make([]byte, pageSize); return &b }},
 		roFiles:           make(map[any]*baseImageState),
 		maxIdleBase:       maxIdleBase,
 		snapshots:         make(set.Set[*Snapshot]),
@@ -728,7 +730,15 @@ func (s *Server) serveTransmission(snap *Snapshot, r io.Reader, bw *bufio.Writer
 
 		case nbdCmdTrim:
 			s.ops.Add("trim", 1)
-			snap.handleTrim(req.Offset, uint64(req.Length))
+			if err := snap.handleTrim(req.Offset, uint64(req.Length)); err != nil {
+				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
+					return werr
+				}
+				if werr := bw.Flush(); werr != nil {
+					return werr
+				}
+				continue
+			}
 			if err := s.sendReply(bw, req.Handle, 0, nil); err != nil {
 				return err
 			}

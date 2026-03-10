@@ -68,6 +68,7 @@ func (c *pageCache) Get(h pageHash) ([]byte, bool) {
 }
 
 // Put adds page data to the cache, keyed by its hash.
+// The data slice is cloned; the caller retains ownership of the original.
 // If the hash already exists, it's moved to the front of the LRU.
 func (c *pageCache) Put(h pageHash, data []byte) {
 	c.mu.Lock()

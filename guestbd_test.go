@@ -321,6 +321,56 @@ func TestReadBasic(t *testing.T) {
 	}
 }
 
+func TestReadAtAlignment(t *testing.T) {
+	const pageSize = 4096
+	data := make([]byte, pageSize*6)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+
+	addr, _, cleanup := startTestServer(t, data, pageSize)
+	defer cleanup()
+
+	c := newTestClient(t, addr)
+	defer c.disconnect()
+
+	tests := []struct {
+		name   string
+		off    uint64
+		length uint32
+	}{
+		// Within a single page, not at offset 0.
+		{"mid-page-short-read", 100, 50},
+		// Page-aligned start, sub-page length.
+		{"aligned-start-sub-page", 0, 100},
+		// Starts mid-page, ends at exact page boundary.
+		{"mid-to-page-boundary", 100, pageSize - 100},
+		// Starts at page boundary, ends mid-next-page.
+		{"page-boundary-into-next", pageSize, pageSize + 200},
+		// Unaligned start and end spanning 3 pages:
+		// partial first + full middle + partial last.
+		{"unaligned-multi-page", 100, pageSize*2 + 200},
+		// Multiple full aligned pages.
+		{"multi-full-pages", 0, pageSize * 3},
+		// Single byte at page boundary.
+		{"one-byte-at-boundary", pageSize, 1},
+		// Single byte just before page boundary.
+		{"one-byte-before-boundary", pageSize - 1, 1},
+		// Single byte just after page boundary.
+		{"one-byte-after-boundary", pageSize + 1, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := c.read(tt.off, tt.length)
+			want := data[tt.off : tt.off+uint64(tt.length)]
+			if !bytes.Equal(got, want) {
+				t.Fatalf("off=%d len=%d: got %x... want %x...",
+					tt.off, tt.length, got[:min(len(got), 16)], want[:min(len(want), 16)])
+			}
+		})
+	}
+}
+
 func TestWriteAndReadBack(t *testing.T) {
 	const pageSize = 4096
 	data := make([]byte, pageSize*4)
@@ -462,6 +512,104 @@ func TestTrim(t *testing.T) {
 	if !bytes.Equal(got, original) {
 		t.Fatal("trim should revert to original")
 	}
+}
+
+func TestTrimAlignment(t *testing.T) {
+	const pageSize = 4096
+	// Non-zero original so we can distinguish "reverted to base" from "zeroed".
+	original := make([]byte, pageSize*4)
+	for i := range original {
+		original[i] = byte(i % 251)
+	}
+
+	t.Run("mid-page", func(t *testing.T) {
+		// Trim within a single dirty page: trimmed bytes become zero,
+		// rest of page stays dirty.
+		addr, _, cleanup := startTestServer(t, original, pageSize)
+		defer cleanup()
+		c := newTestClient(t, addr)
+		defer c.disconnect()
+
+		c.write(0, bytes.Repeat([]byte{0xFF}, pageSize))
+		c.trim(100, 200) // zero bytes 100..299
+
+		got := c.read(0, pageSize)
+		expected := bytes.Repeat([]byte{0xFF}, pageSize)
+		for i := 100; i < 300; i++ {
+			expected[i] = 0
+		}
+		if !bytes.Equal(got, expected) {
+			t.Fatal("mid-page trim mismatch")
+		}
+	})
+
+	t.Run("cross-boundary-partial", func(t *testing.T) {
+		// Trim crossing page boundary, not fully covering either page.
+		// Both partial pages get zero-writes.
+		addr, _, cleanup := startTestServer(t, original, pageSize)
+		defer cleanup()
+		c := newTestClient(t, addr)
+		defer c.disconnect()
+
+		c.write(0, bytes.Repeat([]byte{0xFF}, pageSize*2))
+		c.trim(uint64(pageSize-100), 200) // zero last 100 bytes of page 0, first 100 of page 1
+
+		got := c.read(0, pageSize*2)
+		expected := bytes.Repeat([]byte{0xFF}, pageSize*2)
+		for i := pageSize - 100; i < pageSize+100; i++ {
+			expected[i] = 0
+		}
+		if !bytes.Equal(got, expected) {
+			t.Fatal("cross-boundary trim mismatch")
+		}
+	})
+
+	t.Run("partial-full-partial", func(t *testing.T) {
+		// Trim partially covers first and last page, fully covers middle.
+		// Partial pages get zero-writes; full middle page reverts to original.
+		addr, _, cleanup := startTestServer(t, original, pageSize)
+		defer cleanup()
+		c := newTestClient(t, addr)
+		defer c.disconnect()
+
+		c.write(0, bytes.Repeat([]byte{0xFF}, pageSize*3))
+		c.trim(uint64(pageSize-100), pageSize+200) // partial page 0, full page 1, partial page 2
+
+		got := c.read(0, pageSize*3)
+		expected := bytes.Repeat([]byte{0xFF}, pageSize*3)
+		// Partial end of page 0: zeroed.
+		for i := pageSize - 100; i < pageSize; i++ {
+			expected[i] = 0
+		}
+		// Full page 1: reverts to original.
+		copy(expected[pageSize:pageSize*2], original[pageSize:pageSize*2])
+		// Partial start of page 2: zeroed.
+		for i := pageSize * 2; i < pageSize*2+100; i++ {
+			expected[i] = 0
+		}
+		if !bytes.Equal(got, expected) {
+			t.Fatal("partial-full-partial trim mismatch")
+		}
+	})
+
+	t.Run("exact-full-page", func(t *testing.T) {
+		// Trim exactly covers one page: reverts to base image.
+		addr, _, cleanup := startTestServer(t, original, pageSize)
+		defer cleanup()
+		c := newTestClient(t, addr)
+		defer c.disconnect()
+
+		c.write(0, bytes.Repeat([]byte{0xFF}, pageSize*3))
+		c.trim(uint64(pageSize), uint32(pageSize))
+
+		got := c.read(0, pageSize*3)
+		expected := bytes.Repeat([]byte{0xFF}, pageSize*3)
+		// Page 1 reverts to original.
+		copy(expected[pageSize:pageSize*2], original[pageSize:pageSize*2])
+		if !bytes.Equal(got, expected) {
+			t.Fatal("exact-full-page trim mismatch")
+		}
+	})
 }
 
 func TestFlush(t *testing.T) {

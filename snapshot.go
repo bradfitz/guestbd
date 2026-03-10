@@ -24,9 +24,9 @@ type Snapshot struct {
 	roFile *baseImageState
 
 	mu           sync.Mutex
-	dirtyPages   map[int64]*dirtyPageInfo // pageNum => dirty info
-	dirtyFile    *os.File                 // temp file for dirty page data
-	nextDirtyNum int                      // monotonically increasing
+	dirtyPages   map[int64]dirtyPageInfo // pageNum => dirty info
+	dirtyFile    *os.File                // temp file for dirty page data
+	nextDirtyNum int                     // monotonically increasing
 }
 
 // dirtyPageInfo tracks a written page in a snapshot.
@@ -48,7 +48,7 @@ func newSnapshot(srv *Server, ro *baseImageState) (*Snapshot, error) {
 	return &Snapshot{
 		server:     srv,
 		roFile:     ro,
-		dirtyPages: make(map[int64]*dirtyPageInfo),
+		dirtyPages: make(map[int64]dirtyPageInfo),
 		dirtyFile:  tmpFile,
 	}, nil
 }
@@ -71,9 +71,13 @@ func (c *Snapshot) Close() error {
 	return nil
 }
 
-// readPageData reads a full page, checking dirty pages first,
+// readPageData reads a full page into buf, checking dirty pages first,
 // then falling back to the readonly file.
-func (c *Snapshot) readPageData(pageNum int64) ([]byte, error) {
+// buf must be at least pageSize bytes long or readPageData panics.
+func (c *Snapshot) readPageData(buf []byte, pageNum int64) error {
+	pageSize := c.server.pageSize
+	_ = buf[pageSize-1] // bounds check hint; panics if too small
+
 	c.mu.Lock()
 	dp, dirty := c.dirtyPages[pageNum]
 	c.mu.Unlock()
@@ -86,24 +90,24 @@ func (c *Snapshot) readPageData(pageNum int64) ([]byte, error) {
 		if cache != nil {
 			// Try the global cache first.
 			if data, ok := cache.Get(dp.hash); ok {
-				return data, nil
+				copy(buf, data)
+				return nil
 			}
 		}
 		// Read from the snapshot's dirty file.
-		buf := make([]byte, c.server.pageSize)
-		_, err := c.dirtyFile.ReadAt(buf, int64(dp.dirtyNum)*int64(c.server.pageSize))
+		_, err := c.dirtyFile.ReadAt(buf[:pageSize], int64(dp.dirtyNum)*int64(pageSize))
 		if err != nil {
-			return nil, fmt.Errorf("reading dirty page: %w", err)
+			return fmt.Errorf("reading dirty page: %w", err)
 		}
 		if cache != nil {
-			cache.Put(dp.hash, buf)
+			cache.Put(dp.hash, buf[:pageSize])
 		}
-		return buf, nil
+		return nil
 	}
 
-	data, _, result, err := c.roFile.readPage(pageNum)
+	_, result, err := c.roFile.readPage(buf, pageNum)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	switch result {
 	case readFromCache:
@@ -113,7 +117,7 @@ func (c *Snapshot) readPageData(pageNum int64) ([]byte, error) {
 	case readFromDiskMiss:
 		c.server.readPath.Add("base_disk_miss", 1)
 	}
-	return data, nil
+	return nil
 }
 
 // ReadAt reads len(p) bytes from the snapshot starting at byte offset off.
@@ -122,25 +126,33 @@ func (c *Snapshot) ReadAt(p []byte, off int64) (int, error) {
 	length := uint64(len(p))
 	c.server.readBytes.Add(int64(length))
 
-	offset := uint64(off)
 	pageSize := uint64(c.server.pageSize)
 
 	pos := uint64(0)
 	for pos < length {
-		absOffset := offset + pos
+		absOffset := uint64(off) + pos
 		pageNum := int64(absOffset / pageSize)
 		pageOffset := absOffset % pageSize
 
-		pageData, err := c.readPageData(pageNum)
-		if err != nil {
-			return int(pos), err
-		}
+		// Read up to the end of the page or the end of the requested length,
+		// whichever is smaller. Usually this will be pageSize, except for the
+		// first and last pages if the ReadAt call isn't page-aligned.
+		n := min(pageSize-pageOffset, length-pos)
 
-		n := pageSize - pageOffset
-		if n > length-pos {
-			n = length - pos
+		if pageOffset == 0 && n == pageSize {
+			// Full page; read directly into the caller's buffer.
+			if err := c.readPageData(p[pos:pos+pageSize], pageNum); err != nil {
+				return int(pos), err
+			}
+		} else {
+			// Partial page; need a scratch buffer from the pool.
+			bufp := c.server.pageBufPool.Get().(*[]byte)
+			if err := c.readPageData(*bufp, pageNum); err != nil {
+				return int(pos), err
+			}
+			copy(p[pos:pos+n], (*bufp)[pageOffset:pageOffset+n])
+			c.server.pageBufPool.Put(bufp)
 		}
-		copy(p[pos:pos+n], pageData[pageOffset:pageOffset+n])
 		pos += n
 	}
 	return int(pos), nil
@@ -167,19 +179,15 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 			n = length - pos
 		}
 
-		var pageData []byte
+		pageData := make([]byte, pageSize)
 		if pageOffset == 0 && n == pageSize {
 			// Full page write.
-			pageData = make([]byte, pageSize)
 			copy(pageData, p[pos:pos+n])
 		} else {
 			// Partial page write: read-modify-write.
-			existing, err := c.readPageData(pageNum)
-			if err != nil {
+			if err := c.readPageData(pageData, pageNum); err != nil {
 				return int(pos), err
 			}
-			pageData = make([]byte, pageSize)
-			copy(pageData, existing)
 			copy(pageData[pageOffset:], p[pos:pos+n])
 		}
 
@@ -199,7 +207,7 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 			return int(pos), fmt.Errorf("writing dirty page: %w", err)
 		}
 
-		c.dirtyPages[pageNum] = &dirtyPageInfo{
+		c.dirtyPages[pageNum] = dirtyPageInfo{
 			hash:     h,
 			dirtyNum: dirtyNum,
 		}
@@ -214,16 +222,46 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 	return int(pos), nil
 }
 
-// handleTrim forgets dirty pages in the given range, reverting
-// those pages to the base image.
-func (c *Snapshot) handleTrim(offset, length uint64) {
+// handleTrim zeros the given byte range and reverts any fully-covered
+// dirty pages to the base image. Partial pages at the start and end of
+// the range are zero-filled via WriteAt.
+func (c *Snapshot) handleTrim(offset, length uint64) error {
+	end := offset + length
 	pageSize := uint64(c.server.pageSize)
-	startPage := int64(offset / pageSize)
-	endPage := int64((offset + length + pageSize - 1) / pageSize)
 
+	// Round up to the first fully-covered page.
+	firstFullPage := int64((offset + pageSize - 1) / pageSize)
+	// Round down to the last fully-covered page (exclusive).
+	lastFullPageExcl := int64(end / pageSize)
+
+	// Zero partial start page.
+	if startRem := offset % pageSize; startRem != 0 {
+		n := min(pageSize-startRem, length)
+		bufp := c.server.pageBufPool.Get().(*[]byte)
+		clear((*bufp)[:n])
+		_, err := c.WriteAt((*bufp)[:n], int64(offset))
+		c.server.pageBufPool.Put(bufp)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Zero partial end page, if on a different page than the start.
+	if endRem := end % pageSize; endRem != 0 && int64(end/pageSize) >= firstFullPage {
+		bufp := c.server.pageBufPool.Get().(*[]byte)
+		clear((*bufp)[:endRem])
+		_, err := c.WriteAt((*bufp)[:endRem], int64(lastFullPageExcl)*int64(pageSize))
+		c.server.pageBufPool.Put(bufp)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Delete fully-covered pages, reverting them to the base image.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for p := startPage; p < endPage; p++ {
+	for p := firstFullPage; p < lastFullPageExcl; p++ {
 		delete(c.dirtyPages, p)
 	}
+	return nil
 }
