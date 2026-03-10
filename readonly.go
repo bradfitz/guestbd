@@ -23,23 +23,21 @@ type baseImageState struct {
 	mu       sync.Mutex
 	refcount int32 // protected by mu
 	// pageHashes is lazily computed per page.
-	// A zero value means the page has not been read from disk yet.
+	// Absent from the map means the page has not been read from disk yet.
 	// A value equal to Server.zeroPageHash means the page is all zeros.
-	pageHashes []pageHash // protected by mu
+	pageHashes map[int64]pageHash // protected by mu
 }
 
-// newBaseImageState creates a new baseImageState with a pre-allocated pageHashes
-// table sized for the given virtual disk size. The refcount starts at 1.
+// newBaseImageState creates a new baseImageState for the given base image.
+// The refcount starts at 1.
 func newBaseImageState(srv *Server, base BaseImage, key any) *baseImageState {
-	size := base.Size()
-	numPages := (size + int64(srv.pageSize) - 1) / int64(srv.pageSize)
 	return &baseImageState{
 		srv:         srv,
 		base:        base,
-		size:        size,
+		size:        base.Size(),
 		identityKey: key,
 		refcount:    1,
-		pageHashes:  make([]pageHash, numPages),
+		pageHashes:  make(map[int64]pageHash),
 	}
 }
 
@@ -56,14 +54,11 @@ const (
 // and how the read was served (cache hit, cold disk read, or cache miss disk read).
 func (r *baseImageState) readPage(n int64) (data []byte, hash pageHash, result readResult, err error) {
 	r.mu.Lock()
-	h := r.pageHashes[n]
+	h, hashKnown := r.pageHashes[n]
 	r.mu.Unlock()
 
 	cache := r.srv.cache
 	pageSize := r.srv.pageSize
-
-	var zeroHash pageHash
-	hashKnown := h != zeroHash
 	if hashKnown {
 		// Already have the hash; try cache.
 		if d, ok := cache.Get(h); ok {
@@ -86,7 +81,7 @@ func (r *baseImageState) readPage(n int64) (data []byte, hash pageHash, result r
 	h = hashPage(buf)
 
 	r.mu.Lock()
-	if r.pageHashes[n] == zeroHash {
+	if _, ok := r.pageHashes[n]; !ok {
 		r.pageHashes[n] = h
 	}
 	r.mu.Unlock()
