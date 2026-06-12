@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/bradfitz/qcow2"
 	"tailscale.com/metrics"
@@ -182,8 +183,22 @@ type Server struct {
 	writePages       expvar.Int         // counter_guestbd_write_pages
 	readSizeHist     *metrics.Histogram // histogram_guestbd_read_size_bytes
 	writeSizeHist    *metrics.Histogram // histogram_guestbd_write_size_bytes
+	readLatencyHist  *metrics.Histogram // histogram_guestbd_read_latency_seconds
+	writeLatencyHist *metrics.Histogram // histogram_guestbd_write_latency_seconds
 	baseImagesActive expvar.Int         // gauge_guestbd_base_images_active
 	baseImagesCached expvar.Int         // gauge_guestbd_base_images_cached
+}
+
+// latencyBuckets returns the histogram bucket boundaries (in seconds)
+// for NBD read/write latency. The buckets are powers of two from 10µs
+// through ~10s, covering cache-hit reads (microseconds), cold disk
+// reads (milliseconds), and pathological slow ops.
+func latencyBuckets() []float64 {
+	var b []float64
+	for v := 10e-6; v < 16; v *= 2 {
+		b = append(b, v)
+	}
+	return b
 }
 
 // NewServer creates a new Server that serves the base image returned by getBase.
@@ -231,6 +246,8 @@ func NewServer(getBase BaseImageSource, opts ...ServerOption) *Server {
 		readPath:          metrics.LabelMap{Label: "type"},
 		readSizeHist:      metrics.NewHistogram(sizeBuckets),
 		writeSizeHist:     metrics.NewHistogram(sizeBuckets),
+		readLatencyHist:   metrics.NewHistogram(latencyBuckets()),
+		writeLatencyHist:  metrics.NewHistogram(latencyBuckets()),
 	}
 	if cache != nil {
 		srv.zeroPageHash = hashPage(make([]byte, pageSize))
@@ -253,6 +270,8 @@ func (s *Server) InitExpvar() {
 	expvar.Publish("counter_guestbd_write_pages", &s.writePages)
 	expvar.Publish("histogram_guestbd_read_size_bytes", s.readSizeHist)
 	expvar.Publish("histogram_guestbd_write_size_bytes", s.writeSizeHist)
+	expvar.Publish("histogram_guestbd_read_latency_seconds", s.readLatencyHist)
+	expvar.Publish("histogram_guestbd_write_latency_seconds", s.writeLatencyHist)
 	if s.cache != nil {
 		expvar.Publish("counter_guestbd_cache", &s.cache.path)
 		expvar.Publish("gauge_guestbd_cache_entries", &s.cache.entries)
@@ -674,7 +693,10 @@ func (s *Server) serveTransmission(snap *Snapshot, r io.Reader, bw *bufio.Writer
 			s.ops.Add("read", 1)
 			s.readSizeHist.Observe(float64(req.Length))
 			buf = slices.Grow(buf[:0], int(req.Length))[:req.Length]
-			if _, err := snap.ReadAt(buf, int64(req.Offset)); err != nil {
+			t0 := time.Now()
+			_, err := snap.ReadAt(buf, int64(req.Offset))
+			s.readLatencyHist.Observe(time.Since(t0).Seconds())
+			if err != nil {
 				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
 					return werr
 				}
@@ -697,7 +719,10 @@ func (s *Server) serveTransmission(snap *Snapshot, r io.Reader, bw *bufio.Writer
 			if _, err := io.ReadFull(r, buf); err != nil {
 				return fmt.Errorf("reading write data: %w", err)
 			}
-			if _, err := snap.WriteAt(buf, int64(req.Offset)); err != nil {
+			t0 := time.Now()
+			_, err := snap.WriteAt(buf, int64(req.Offset))
+			s.writeLatencyHist.Observe(time.Since(t0).Seconds())
+			if err != nil {
 				if werr := s.sendReply(bw, req.Handle, nbdEIO, nil); werr != nil {
 					return werr
 				}

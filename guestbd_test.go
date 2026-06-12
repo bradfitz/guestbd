@@ -6,13 +6,38 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestLatencyBuckets(t *testing.T) {
+	got := latencyBuckets()
+	want := []float64{
+		10e-6, 20e-6, 40e-6, 80e-6,
+		160e-6, 320e-6, 640e-6, 1280e-6,
+		2560e-6, 5120e-6, 10240e-6, 20480e-6,
+		40960e-6, 81920e-6, 163840e-6, 327680e-6,
+		655360e-6, 1310720e-6, 2621440e-6, 5242880e-6,
+		10485760e-6,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d buckets, want %d: %v", len(got), len(want), got)
+	}
+	for i, g := range got {
+		if math.Abs(g-want[i])/want[i] > 1e-9 {
+			t.Errorf("bucket %d: got %g, want %g", i, g, want[i])
+		}
+	}
+	t.Logf("%d buckets, first=%v, last=%v",
+		len(got), time.Duration(got[0]*float64(time.Second)),
+		time.Duration(got[len(got)-1]*float64(time.Second)))
+}
 
 // testNBDClient is a pure Go NBD client for testing.
 type testNBDClient struct {
