@@ -94,6 +94,8 @@ tailscale.com/metrics's LabelMap and Histogram types.
 |--------|-------------|
 | `guestbd_read_size_bytes` | Distribution of NBD read request sizes |
 | `guestbd_write_size_bytes` | Distribution of NBD write request sizes |
+| `guestbd_read_latency_seconds` | Distribution of NBD read latencies (snapshot ReadAt only, excludes wire I/O) |
+| `guestbd_write_latency_seconds` | Distribution of NBD write latencies (snapshot WriteAt only, excludes wire I/O) |
 
 The `read_path` metric is particularly useful for diagnosing cache effectiveness:
 
