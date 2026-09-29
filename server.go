@@ -505,6 +505,15 @@ func (s *Server) getOrCreateSnapshot() (snap *Snapshot, owned bool, err error) {
 	return snap, false, nil
 }
 
+// SharedSnapshot returns the Snapshot shared by all connections of a server
+// created with WithSharedSnapshot, or nil if no client has connected yet
+// (or the server doesn't share one).
+func (s *Server) SharedSnapshot() *Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sharedSnap
+}
+
 // Serve accepts incoming connections on the listener ln, handling
 // each one on a new goroutine. Serve blocks until the listener
 // returns an error. The caller is responsible for closing ln.
