@@ -166,10 +166,10 @@ type Server struct {
 	pageBufPool       sync.Pool       // immutable; pool of *[]byte, each pageSize long
 
 	mu          sync.Mutex
-	sharedSnap  *Snapshot                // lazily created when useSharedSnapshot is true
-	roFiles     map[any]*baseImageState  // identity-keyed entries (active + idle)
-	roFileNoKey *baseImageState          // single entry for nil-key sources
-	nextIdleSeq int64                    // monotonic counter for idle LRU ordering
+	sharedSnap  *Snapshot               // lazily created when useSharedSnapshot is true
+	roFiles     map[any]*baseImageState // identity-keyed entries (active + idle)
+	roFileNoKey *baseImageState         // single entry for nil-key sources
+	nextIdleSeq int64                   // monotonic counter for idle LRU ordering
 	snapshots   set.Set[*Snapshot]
 
 	// Metrics (atomic, no mutex needed):
@@ -617,7 +617,12 @@ func (s *Server) serveNBD(snap *Snapshot, nc net.Conn) error {
 			}
 			return bw.Flush()
 
-		case nbdOptGo:
+		case nbdOptInfo, nbdOptGo:
+			// NBD_OPT_INFO gets the same replies as NBD_OPT_GO but stays in
+			// option haggling. Apple's Virtualization.framework client
+			// sends NBD_OPT_INFO before NBD_OPT_GO and gives up if it is
+			// unsupported.
+			//
 			// Send NBD_INFO_EXPORT.
 			var infoData [12]byte
 			binary.BigEndian.PutUint16(infoData[0:2], nbdInfoExport)
@@ -641,6 +646,9 @@ func (s *Server) serveNBD(snap *Snapshot, nc net.Conn) error {
 			}
 			if err := bw.Flush(); err != nil {
 				return err
+			}
+			if optCode == nbdOptInfo {
+				continue
 			}
 			return s.serveTransmission(snap, r, bw)
 

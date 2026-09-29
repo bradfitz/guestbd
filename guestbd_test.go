@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -82,15 +83,25 @@ func (c *testNBDClient) handshake() {
 		c.t.Fatalf("write client flags: %v", err)
 	}
 
-	// Send NBD_OPT_GO with empty export name.
-	var optBuf [22]byte
+	c.infoOpt(nbdOptGo)
+}
+
+// infoOpt sends NBD_OPT_GO or NBD_OPT_INFO with an empty export name and
+// the given info requests, and reads replies until the ACK. It returns the
+// info types the server sent.
+func (c *testNBDClient) infoOpt(optCode uint32, infoReqs ...uint16) (infoTypes []uint16) {
+	c.t.Helper()
+	optBuf := make([]byte, 22+2*len(infoReqs))
 	binary.BigEndian.PutUint64(optBuf[0:8], nbdOptsMagic)
-	binary.BigEndian.PutUint32(optBuf[8:12], nbdOptGo)
-	binary.BigEndian.PutUint32(optBuf[12:16], 6) // data length: name_len(4) + name(0) + info_count(2)
-	binary.BigEndian.PutUint32(optBuf[16:20], 0) // name length
-	binary.BigEndian.PutUint16(optBuf[20:22], 0) // number of info requests
-	if _, err := c.conn.Write(optBuf[:]); err != nil {
-		c.t.Fatalf("write opt go: %v", err)
+	binary.BigEndian.PutUint32(optBuf[8:12], optCode)
+	binary.BigEndian.PutUint32(optBuf[12:16], uint32(6+2*len(infoReqs))) // name_len(4) + name(0) + info_count(2) + requests
+	binary.BigEndian.PutUint32(optBuf[16:20], 0)                         // name length
+	binary.BigEndian.PutUint16(optBuf[20:22], uint16(len(infoReqs)))     // number of info requests
+	for i, r := range infoReqs {
+		binary.BigEndian.PutUint16(optBuf[22+2*i:], r)
+	}
+	if _, err := c.conn.Write(optBuf); err != nil {
+		c.t.Fatalf("write opt %d: %v", optCode, err)
 	}
 
 	// Read option replies until ACK.
@@ -113,19 +124,61 @@ func (c *testNBDClient) handshake() {
 			}
 		}
 
-		if replyType == nbdRepInfo && replyLen >= 12 {
+		if replyType == nbdRepInfo && replyLen >= 2 {
 			infoType := binary.BigEndian.Uint16(replyData[0:2])
-			if infoType == nbdInfoExport {
+			infoTypes = append(infoTypes, infoType)
+			if infoType == nbdInfoExport && replyLen >= 12 {
 				c.exportSize = binary.BigEndian.Uint64(replyData[2:10])
 			}
 		}
 
 		if replyType == nbdRepAck {
-			break
+			return infoTypes
 		}
 		if replyType&(1<<31) != 0 {
 			c.t.Fatalf("opt reply error: type=%#x", replyType)
 		}
+	}
+}
+
+// TestOptInfoThenGo tests the option sequence Apple's Virtualization.framework
+// NBD client uses: NBD_OPT_INFO asking for the block size, then NBD_OPT_GO.
+func TestOptInfoThenGo(t *testing.T) {
+	const pageSize = 4096
+	data := make([]byte, pageSize*2)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	addr, _, cleanup := startTestServer(t, data, pageSize)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &testNBDClient{t: t, conn: conn}
+	defer c.disconnect()
+	var greeting [18]byte
+	if _, err := io.ReadFull(conn, greeting[:]); err != nil {
+		t.Fatal(err)
+	}
+	// Fixed newstyle only, as Apple's client sends.
+	var clientFlags [4]byte
+	binary.BigEndian.PutUint32(clientFlags[:], nbdFlagCFixedNewstyle)
+	if _, err := conn.Write(clientFlags[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	infos := c.infoOpt(nbdOptInfo, nbdInfoBlockSize)
+	if !slices.Contains(infos, nbdInfoExport) || !slices.Contains(infos, nbdInfoBlockSize) {
+		t.Fatalf("NBD_OPT_INFO replies = %v; want export and block size info", infos)
+	}
+	if c.exportSize != uint64(len(data)) {
+		t.Fatalf("export size = %d, want %d", c.exportSize, len(data))
+	}
+	c.infoOpt(nbdOptGo, nbdInfoBlockSize)
+	if got := c.read(pageSize, 100); !bytes.Equal(got, data[pageSize:pageSize+100]) {
+		t.Fatal("read after NBD_OPT_INFO + NBD_OPT_GO mismatch")
 	}
 }
 
