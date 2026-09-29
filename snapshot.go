@@ -3,7 +3,9 @@ package guestbd
 import (
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"sync"
 )
 
@@ -220,6 +222,41 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 		pos += n
 	}
 	return int(pos), nil
+}
+
+// WriteDirtyTo writes every page written to the snapshot, at its offset,
+// to w, and returns the number of pages written. Writing them to a copy of
+// the base image makes that copy equal to the snapshot's contents, which
+// persists a snapshot (for example, a VM image warmed up by booting it over
+// NBD). The final page is truncated to the image size.
+//
+// The caller should ensure nothing writes to the snapshot meanwhile;
+// concurrent writes may or may not be included.
+func (c *Snapshot) WriteDirtyTo(w io.WriterAt) (pages int, err error) {
+	c.mu.Lock()
+	pageNums := slices.Sorted(maps.Keys(c.dirtyPages))
+	c.mu.Unlock()
+
+	pageSize := int64(c.server.pageSize)
+	size := c.roFile.size
+	bufp := c.server.pageBufPool.Get().(*[]byte)
+	defer c.server.pageBufPool.Put(bufp)
+	buf := *bufp
+	for _, p := range pageNums {
+		off := p * pageSize
+		if off >= size {
+			continue
+		}
+		if err := c.readPageData(buf, p); err != nil {
+			return pages, err
+		}
+		n := min(pageSize, size-off)
+		if _, err := w.WriteAt(buf[:n], off); err != nil {
+			return pages, err
+		}
+		pages++
+	}
+	return pages, nil
 }
 
 // handleTrim zeros the given byte range and reverts any fully-covered
