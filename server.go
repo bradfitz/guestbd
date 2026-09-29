@@ -99,7 +99,7 @@ func FileSource(path string) BaseImageSource {
 			return nil, err
 		}
 		st := fi.Sys().(*syscall.Stat_t)
-		key := fileIdentityKey{dev: st.Dev, ino: st.Ino}
+		key := fileIdentityKey{dev: uint64(st.Dev), ino: st.Ino} // Dev is int32 on darwin
 		if strings.HasSuffix(path, ".qcow2") {
 			img, err := qcow2.Open(f)
 			if err != nil {
