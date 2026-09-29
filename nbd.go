@@ -28,6 +28,7 @@ const (
 	nbdOptExportName uint32 = 1
 	nbdOptAbort      uint32 = 2
 	nbdOptList       uint32 = 3
+	nbdOptInfo       uint32 = 6
 	nbdOptGo         uint32 = 7
 
 	// Option reply types
